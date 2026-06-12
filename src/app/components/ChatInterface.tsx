@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react';
 import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink, Link2 } from 'lucide-react';
-import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SessionStatus, StatusEvent } from '../api';
+import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SafeVerifyResult, SessionStatus, StatusEvent } from '../api';
 import { codeStepFallbackContent } from '../stepTimeline.mjs';
 import { buildRunTimelineSections } from '../runAttempts';
 import { MarkdownMessage } from './MarkdownMessage';
+import { SafeVerifyBadge } from './SafeVerifyBadge';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
 
 export function ChatInterface({
@@ -42,10 +43,12 @@ export function ChatInterface({
   selectedProjectId,
   onProjectChange,
   onCreateProject,
+  safeVerify,
 }: {
   error?: string;
   isPaused: boolean;
   isRunning: boolean;
+  safeVerify?: SafeVerifyResult | null;
   pendingApproval?: PendingApproval;
   isSubmittingApproval: boolean;
   approvalError?: string;
@@ -436,6 +439,8 @@ export function ChatInterface({
             )}
           </div>
         ))}
+
+        {safeVerify && !isRunning && <SafeVerifyBadge result={safeVerify} />}
 
         {isSubmitting && !isRunning && (
           <div className="text-sm text-muted-foreground">

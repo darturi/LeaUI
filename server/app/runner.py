@@ -11,6 +11,7 @@ from queue import Queue
 from threading import Lock
 from typing import Any
 
+from . import safe_verify as safe_verify_service
 from . import settings as settings_service
 from . import store
 from .config import ROOT, LeaConfig
@@ -1259,6 +1260,16 @@ def run_lea(context: RunnerContext) -> None:
         )
         store.set_run_pending_approval(context.run_id, None)
         store.touch_session(context.session_id, terminal_status)
+        # A successful proof run gets a kernel-level SafeVerify audit. We only
+        # flag it as pending here; the browser fires the (~100s) check via
+        # /api/runs/{id}/safe-verify so it never blocks the `done` event.
+        safe_verify_pending = (
+            terminal_status == "success"
+            and not assistant_mode
+            and safe_verify_service.is_available(context.config)
+        )
+        if safe_verify_pending:
+            store.set_run_safe_verify(context.run_id, "pending", None)
         emit(
             context.events,
             "done",
@@ -1268,6 +1279,7 @@ def run_lea(context: RunnerContext) -> None:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": cost_usd,
+                "safe_verify": "pending" if safe_verify_pending else None,
             },
         )
     except Exception as exc:

@@ -63,6 +63,8 @@ def init_db() -> None:
                 input_tokens integer default 0,
                 output_tokens integer default 0,
                 final_text text,
+                safe_verify_status text,
+                safe_verify_detail text,
                 created_at text not null,
                 updated_at text not null
             );
@@ -141,6 +143,10 @@ def init_db() -> None:
             conn.execute("alter table runs add column pending_approval text")
         if "project_id" not in run_columns:
             conn.execute("alter table runs add column project_id text references projects(id)")
+        if "safe_verify_status" not in run_columns:
+            conn.execute("alter table runs add column safe_verify_status text")
+        if "safe_verify_detail" not in run_columns:
+            conn.execute("alter table runs add column safe_verify_detail text")
 
         session_columns = {
             row["name"]

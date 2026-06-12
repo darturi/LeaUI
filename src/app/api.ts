@@ -111,8 +111,23 @@ export interface SessionDetail extends SessionSummary {
     status: string;
     pending_approval?: PendingApproval | null;
   } | null;
+  safe_verify?: SafeVerifyResult | null;
   project?: Project | null;
   project_theorem?: ProjectTheoremEntry | null;
+}
+
+export type SafeVerifyStatus =
+  | 'pending'
+  | 'running'
+  | 'passed'
+  | 'failed'
+  | 'error'
+  | 'unavailable';
+
+export interface SafeVerifyResult {
+  run_id?: string;
+  status: SafeVerifyStatus;
+  detail?: string | null;
 }
 
 export interface Project {
@@ -418,6 +433,15 @@ export async function submitApproval(
     const detail = await response.json().catch(() => ({}));
     throw new Error(detail.detail || `Failed to submit approval: ${response.statusText}`);
   }
+}
+
+export async function submitSafeVerify(runId: string): Promise<SafeVerifyResult> {
+  const response = await fetch(`/api/runs/${runId}/safe-verify`, { method: 'POST' });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || `SafeVerify failed: ${response.statusText}`);
+  }
+  return response.json();
 }
 
 async function errorMessage(response: Response, fallback: string): Promise<string> {

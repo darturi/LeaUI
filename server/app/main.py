@@ -29,6 +29,7 @@ from .project_unassignment import (
     unassign_project_theorem,
 )
 from .runner import RunnerContext, run_lea
+from . import safe_verify as safe_verify_service
 from . import settings as settings_service
 from . import store
 
@@ -302,6 +303,46 @@ def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionReq
 
     if request.decision == "accept":
         _cleanup_translation_proposals(approval_id, config)
+    return result
+
+
+_SAFE_VERIFY_TERMINAL = {"passed", "failed", "unavailable", "error"}
+
+
+@app.post("/api/runs/{run_id}/safe-verify")
+def safe_verify_run(run_id: str) -> dict:
+    """Run SafeVerify on a finished run's proof (kernel replay + axiom audit).
+
+    Idempotent: a cached terminal verdict is returned without re-running the
+    ~100s check. Concurrent callers get ``running`` instead of queuing a second.
+    """
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cached = run.get("safe_verify_status")
+    if cached in _SAFE_VERIFY_TERMINAL:
+        return {"status": cached, "detail": run.get("safe_verify_detail")}
+
+    config = load_config()
+    if not safe_verify_service.is_available(config):
+        store.set_run_safe_verify(run_id, "unavailable", "SafeVerify is not built on this server.")
+        return {"status": "unavailable", "detail": "SafeVerify is not built on this server."}
+
+    step = store.last_lean_code_step_for_run(run_id)
+    if not step:
+        store.set_run_safe_verify(run_id, "error", "No Lean proof file was found for this run.")
+        return {"status": "error", "detail": "No Lean proof file was found for this run."}
+
+    if not safe_verify_service.try_acquire():
+        store.set_run_safe_verify(run_id, "running", None)
+        return {"status": "running", "detail": "SafeVerify is already running."}
+    try:
+        store.set_run_safe_verify(run_id, "running", None)
+        result = safe_verify_service.verify(config, str(step.get("code") or ""), str(step.get("path") or ""))
+    finally:
+        safe_verify_service.release()
+    store.set_run_safe_verify(run_id, result["status"], result.get("detail"))
     return result
 
 
