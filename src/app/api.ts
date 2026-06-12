@@ -238,6 +238,7 @@ export interface ModelOption {
 export interface ApiKeyStatus {
   configured: boolean;
   last4?: string | null;
+  label: string;
 }
 
 export interface AppSettings {
@@ -247,7 +248,8 @@ export interface AppSettings {
   max_turns?: number | null;
   max_spend_usd?: number | null;
   current_spend_usd: number;
-  api_keys: Record<'openai' | 'anthropic' | 'google', ApiKeyStatus>;
+  // Keyed by LiteLLM env var name (OPENAI_API_KEY, MISTRAL_API_KEY, …).
+  api_keys: Record<string, ApiKeyStatus>;
   model_options: ModelOption[];
   permission_tiers: { value: PermissionTier; label: string }[];
 }
@@ -258,7 +260,44 @@ export interface SettingsUpdate {
   theorem_translation_max_retries?: number;
   max_turns?: number | null;
   max_spend_usd?: number | null;
-  api_keys?: Partial<Record<'openai' | 'anthropic' | 'google', { value?: string; clear?: boolean }>>;
+  // Keyed by env var name; each entry sets or clears that provider's key.
+  api_keys?: Record<string, { value?: string; clear?: boolean }>;
+}
+
+export interface ModelCatalogEntry {
+  value: string;
+  label: string;
+  provider: string;
+}
+
+export interface ModelRequiredKey {
+  env: string;
+  label: string;
+  configured: boolean;
+}
+
+export interface ModelRequirements {
+  model: string;
+  provider?: string | null;
+  required_keys: ModelRequiredKey[];
+  satisfied: boolean;
+}
+
+export async function fetchModelCatalog(): Promise<ModelCatalogEntry[]> {
+  const response = await fetch('/api/models');
+  if (!response.ok) {
+    throw new Error(`Failed to load models: ${response.statusText}`);
+  }
+  const data = await response.json();
+  return Array.isArray(data.models) ? data.models : [];
+}
+
+export async function fetchModelRequirements(model: string): Promise<ModelRequirements> {
+  const response = await fetch(`/api/models/requirements?model=${encodeURIComponent(model)}`);
+  if (!response.ok) {
+    throw new Error(`Failed to load model requirements: ${response.statusText}`);
+  }
+  return response.json();
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {

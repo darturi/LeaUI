@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# Legacy flat TOML key -> the LiteLLM env var it maps to. Kept for back-compat;
+# any other provider key is stored under its uppercase env var name directly.
+LEGACY_KEY_ENV = {
+    "google_api_key": "GOOGLE_API_KEY",
+    "anthropic_api_key": "ANTHROPIC_API_KEY",
+    "openai_api_key": "OPENAI_API_KEY",
+}
+_ENV_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*_API_KEY")
 
 
 @dataclass(frozen=True)
@@ -22,6 +32,10 @@ class LeaConfig:
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     openai_base_url: str | None = None
+    # Provider API keys keyed by LiteLLM env var name (GOOGLE_API_KEY,
+    # MISTRAL_API_KEY, …). Unifies the legacy three flat keys with any
+    # additional providers so the prover env can be populated generically.
+    api_keys: dict[str, str] = field(default_factory=dict)
     narrate_tool_steps: bool = False
     permission_tier: str = "none"
     theorem_translation_max_retries: int = 3
@@ -64,6 +78,16 @@ def load_config(path: Path | None = None) -> LeaConfig:
         if max_spend_usd < 0:
             raise ValueError("max_spend_usd must be greater than or equal to 0")
 
+    # Build the unified env-var-keyed key map: legacy flat keys first, then any
+    # uppercase ENV_VAR_NAME root entries (additional providers).
+    api_keys: dict[str, str] = {}
+    for flat_key, env_name in LEGACY_KEY_ENV.items():
+        if data.get(flat_key):
+            api_keys[env_name] = str(data[flat_key])
+    for key, value in data.items():
+        if isinstance(key, str) and _ENV_KEY_RE.fullmatch(key) and value:
+            api_keys[key] = str(value)
+
     return LeaConfig(
         model=data.get("model", "gemini/gemini-3.1-pro-preview"),
         max_turns=int(max_turns) if max_turns is not None else None,
@@ -76,6 +100,7 @@ def load_config(path: Path | None = None) -> LeaConfig:
         anthropic_api_key=data.get("anthropic_api_key"),
         openai_api_key=data.get("openai_api_key"),
         openai_base_url=data.get("openai_base_url"),
+        api_keys=api_keys,
         narrate_tool_steps=narrate_tool_steps,
         permission_tier=permission_tier,
         theorem_translation_max_retries=theorem_translation_max_retries,

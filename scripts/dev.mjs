@@ -36,6 +36,15 @@ function readConfigStrings() {
       values[key] = match[1];
     }
   }
+  // Additional provider keys are stored as uppercase ENV_VAR_NAME root keys
+  // (e.g. MISTRAL_API_KEY) and injected into the Lea API env verbatim.
+  const extraApiKeys = {};
+  const envKeyPattern = /^\s*([A-Z][A-Z0-9_]*_API_KEY)\s*=\s*"([^"]*)"/gm;
+  let envMatch;
+  while ((envMatch = envKeyPattern.exec(config)) !== null) {
+    extraApiKeys[envMatch[1]] = envMatch[2];
+  }
+  values.__extraApiKeys = extraApiKeys;
   return values;
 }
 
@@ -64,6 +73,11 @@ function leaApiEnv(config) {
   for (const [configKey, envKey] of Object.entries(mappings)) {
     if (config[configKey]) {
       env[envKey] = config[configKey];
+    }
+  }
+  for (const [envKey, value] of Object.entries(config.__extraApiKeys || {})) {
+    if (value) {
+      env[envKey] = value;
     }
   }
   if (config.lea_api_key && !env.LEA_API_KEYS) {

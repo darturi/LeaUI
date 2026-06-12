@@ -27,8 +27,8 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
     assert payload["max_turns"] == 12
     assert payload["max_spend_usd"] == 20.0
     assert payload["theorem_translation_max_retries"] == 4
-    assert payload["api_keys"]["openai"] == {"configured": True, "last4": "1234"}
-    assert payload["api_keys"]["anthropic"] == {"configured": False, "last4": None}
+    assert payload["api_keys"]["OPENAI_API_KEY"] == {"configured": True, "last4": "1234", "label": "OpenAI"}
+    assert payload["api_keys"]["ANTHROPIC_API_KEY"] == {"configured": False, "last4": None, "label": "Anthropic"}
 
 
 def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, monkeypatch):
@@ -56,8 +56,8 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
             "permission_tier": "stepwise",
             "theorem_translation_max_retries": 7,
             "api_keys": {
-                "openai": {"clear": True},
-                "anthropic": {"value": "sk-ant-secret123456"},
+                "OPENAI_API_KEY": {"clear": True},
+                "ANTHROPIC_API_KEY": {"value": "sk-ant-secret123456"},
             },
         },
         config_path,
@@ -92,6 +92,9 @@ def test_update_settings_rejects_invalid_theorem_translation_retries(tmp_path, m
 
 def test_update_settings_rejects_selected_model_without_api_key(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    # The required-key name comes from LiteLLM (env-dependent); make the test
+    # deterministic regardless of the developer's shell.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     db.init_db()
     config_path = tmp_path / "lea.local.toml"
     config_path.write_text(
@@ -104,8 +107,8 @@ def test_update_settings_rejects_selected_model_without_api_key(tmp_path, monkey
     try:
         settings_service.update_settings({"model": "claude-sonnet-4-6"}, config_path)
     except settings_service.SettingsValidationError as exc:
-        assert str(exc) == "An API key for Anthropic is required before saving this model."
-        assert exc.field == "api_keys.anthropic"
+        assert str(exc) == "An API key (Anthropic) is required before saving this model."
+        assert exc.field == "api_keys.ANTHROPIC_API_KEY"
     else:
         raise AssertionError("Expected SettingsValidationError")
 
@@ -125,7 +128,7 @@ def test_update_settings_rejects_malformed_api_key(tmp_path, monkeypatch):
         settings_service.update_settings(
             {
                 "model": "gpt-4o",
-                "api_keys": {"openai": {"value": "not-a-real-key"}},
+                "api_keys": {"OPENAI_API_KEY": {"value": "not-a-real-key"}},
             },
             config_path,
         )
@@ -158,7 +161,7 @@ def test_update_settings_allows_anthropic_prefix_then_defers_to_provider_verific
     settings_service.update_settings(
         {
             "model": "claude-sonnet-4-6",
-            "api_keys": {"anthropic": {"value": "sk-ant-api03-test.value/with+chars"}},
+            "api_keys": {"ANTHROPIC_API_KEY": {"value": "sk-ant-api03-test.value/with+chars"}},
         },
         config_path,
     )
@@ -252,7 +255,7 @@ def test_update_settings_rejects_provider_rejected_api_key(tmp_path, monkeypatch
         settings_service.update_settings(
             {
                 "model": "gpt-4o",
-                "api_keys": {"openai": {"value": "sk-validlooking123456"}},
+                "api_keys": {"OPENAI_API_KEY": {"value": "sk-validlooking123456"}},
             },
             config_path,
         )

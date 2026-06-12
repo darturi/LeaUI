@@ -160,6 +160,18 @@ def settings() -> dict:
     return settings_service.settings_payload()
 
 
+@app.get("/api/models")
+def models() -> dict:
+    """Full LiteLLM chat-model catalog for the searchable model picker."""
+    return {"models": settings_service.model_catalog()}
+
+
+@app.get("/api/models/requirements")
+def model_requirements(model: str) -> dict:
+    """Which API key(s) a model needs and whether they're configured."""
+    return settings_service.model_requirements(model)
+
+
 @app.put("/api/settings")
 def update_settings(request: SettingsRequest) -> dict:
     try:
