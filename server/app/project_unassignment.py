@@ -55,6 +55,8 @@ def unassign_project_theorem(project: dict[str, Any], config: LeaConfig, theorem
         dest_path.write_text(rewritten)
         project_path.write_text(updated_markdown)
         _verify_lean_file(config, dest_path)
+        from .project_usage import detect_used_project_formalizations
+
         message = f"Unassigned {context['target'].name} from {project['title']} and moved it to {context['dest_rel']}."
         code_steps = store.record_project_unassignment(
             context["affected_sessions"],
@@ -62,6 +64,12 @@ def unassign_project_theorem(project: dict[str, Any], config: LeaConfig, theorem
             context["dest_rel"],
             rewritten,
             message,
+            used_project_formalizations=detect_used_project_formalizations(
+                project=project,
+                config=config,
+                code=rewritten,
+                proof_path=context["dest_rel"],
+            ),
         )
     except Exception:
         if moved:

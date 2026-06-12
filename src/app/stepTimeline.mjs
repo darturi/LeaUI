@@ -82,6 +82,11 @@ export function buildStepTimeline({ messages, codeSteps, statusEvents, terminalM
   const userAndSystemMessages = [];
   const terminalMessages = [];
   const assistantMessages = [];
+  const timelineRunId =
+    codeSteps.find((step) => step.run_id)?.run_id ||
+    messages.find((message) => message.run_id)?.run_id ||
+    statusEvents.find((event) => event.run_id)?.run_id ||
+    'timeline';
 
   for (const message of messages) {
     if (message.id === terminalMessageId || message.is_live_terminal_summary) {
@@ -95,11 +100,12 @@ export function buildStepTimeline({ messages, codeSteps, statusEvents, terminalM
 
   const stepCount = Math.max(assistantMessages.length, codeSteps.length);
   const stepItems = Array.from({ length: stepCount }, (_, index) => ({
-    id: codeSteps[index]?.id || assistantMessages[index]?.id || `step-${index + 1}`,
+    id: codeSteps[index]?.id || assistantMessages[index]?.id || `${timelineRunId}:step-${index + 1}`,
     stepIndex: index,
     stepNumber: index + 1,
     message: assistantMessages[index],
     codeStep: codeSteps[index],
+    createdAt: codeSteps[index]?.created_at || assistantMessages[index]?.created_at || null,
     logs: [],
   }));
   const globalLogs = [];

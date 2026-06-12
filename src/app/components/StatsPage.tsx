@@ -33,6 +33,7 @@ const INPUT_COLOR = '#6366f1';
 const OUTPUT_COLOR = '#22d3ee';
 const MONEY_COLOR = '#34d399';
 const MODEL_COLORS = ['#6366f1', '#22d3ee', '#f59e0b', '#34d399', '#a855f7', '#ef4444'];
+const LIVE_STATS_REFRESH_MS = 1000;
 
 function fmtNumber(value: number, digits = 0) {
   return value.toLocaleString('en-US', {
@@ -603,6 +604,10 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
   const [selectedId, setSelectedId] = useState<string>();
   const [error, setError] = useState<string>();
   const [isLoading, setIsLoading] = useState(true);
+  const hasRunningSession = useMemo(
+    () => Boolean(stats?.sessions.some((session) => session.status === 'running')),
+    [stats?.sessions],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -652,8 +657,61 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
     };
   }, [selectedId, sessionDetails]);
 
+  useEffect(() => {
+    if (!hasRunningSession) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const refreshLiveStats = async () => {
+      try {
+        const loaded = await getUsageStats();
+        if (cancelled) {
+          return;
+        }
+        setStats(loaded);
+        setSelectedId((current) => current || loaded.sessions[0]?.id);
+        setError(undefined);
+
+        const selectedIsRunning = Boolean(
+          selectedId && loaded.sessions.some((session) => session.id === selectedId && session.status === 'running'),
+        );
+        if (selectedIsRunning && selectedId) {
+          const detail = await getSession(selectedId);
+          if (!cancelled) {
+            setSessionDetails((current) => ({ ...current, [detail.id]: detail }));
+          }
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Unable to refresh live statistics.');
+        }
+      }
+    };
+
+    const interval = window.setInterval(refreshLiveStats, LIVE_STATS_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [hasRunningSession, selectedId]);
+
   const selectedSummary = stats?.sessions.find((session) => session.id === selectedId);
-  const selectedSession = selectedId ? sessionDetails[selectedId] || selectedSummary : undefined;
+  const selectedSession = useMemo<StatsSessionDetail | undefined>(() => {
+    if (!selectedId) {
+      return undefined;
+    }
+    const detail = sessionDetails[selectedId];
+    if (detail && selectedSummary) {
+      return {
+        ...detail,
+        ...selectedSummary,
+        usage_breakdown: detail.usage_breakdown,
+      };
+    }
+    return detail || selectedSummary;
+  }, [selectedId, selectedSummary, sessionDetails]);
 
   return (
     <div className="flex size-full flex-col bg-background text-foreground">
@@ -671,14 +729,16 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
           Usage & Statistics
         </span>
         <div className="ml-auto flex min-w-0 items-center gap-2">
-          {isLoading ? (
+          {isLoading || hasRunningSession ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
           ) : (
             <Cpu className="h-3.5 w-3.5 text-muted-foreground" />
           )}
           <span className="truncate font-mono text-[0.7rem] text-muted-foreground">
             {stats
-              ? `${stats.global.session_count} sessions - $${stats.global.cost_usd.toFixed(2)} total`
+              ? `${stats.global.session_count} sessions - $${stats.global.cost_usd.toFixed(2)} total${
+                  hasRunningSession ? ' - live' : ''
+                }`
               : 'Statistics'}
           </span>
         </div>

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildStepTimeline } from './stepTimeline.mjs';
+import { timelineIndexForTarget, timelineItemMatchesTarget } from './timelineTarget.mjs';
 
 const baseMessage = {
   session_id: 'session-1',
@@ -181,23 +182,90 @@ test('unnumbered operational logs attach to the nearest step instead of setup', 
   assert.deepEqual(timeline.stepItems[0].logs.map((log) => log.id), ['status-tool']);
 });
 
-test('chat-kind assistant messages are not numbered steps', () => {
-  const timeline = buildStepTimeline({
+test('code step target stays active when narration arrives later', () => {
+  const codeOnlyTimeline = buildStepTimeline({
+    messages: [user('user-1', 'Prove this')],
+    codeSteps: [codeStep('code-1', 1)],
+    statusEvents: [],
+    terminalMessageId: null,
+  });
+  const target = { runId: 'run-1', codeStepId: 'code-1' };
+  assert.equal(timelineItemMatchesTarget(codeOnlyTimeline.stepItems[0], target), true);
+
+  const narratedTimeline = buildStepTimeline({
+    messages: [user('user-1', 'Prove this'), assistant('assistant-1', 'I wrote the Lean proof.')],
+    codeSteps: [codeStep('code-1', 1)],
+    statusEvents: [],
+    terminalMessageId: null,
+  });
+  const sections = [{ id: 'run-1', attemptNumber: 1, stepOffset: 0, timeline: narratedTimeline }];
+
+  assert.equal(timelineIndexForTarget(sections, target), 0);
+  assert.equal(timelineItemMatchesTarget(narratedTimeline.stepItems[0], target), true);
+});
+
+test('live assistant replacement can retarget to persisted assistant message', () => {
+  const liveTimeline = buildStepTimeline({
     messages: [
-      user('u1', 'prove demo'),
-      assistant('a1', 'Wrote the proof.'),
-      user('u2', 'explain this proof'),
-      assistant('a2', 'It uses `trivial` to close `True`.', { kind: 'chat' }),
+      user('user-1', 'Prove this'),
+      assistant('live-run-1', 'I will first simplify the goal.', {
+        live_started_after_assistant_steps: 0,
+        live_started_after_code_steps: 0,
+      }),
     ],
-    codeSteps: [codeStep('c1', 1)],
+    codeSteps: [],
     statusEvents: [],
     terminalMessageId: null,
   });
 
-  // Only the real proof narration is a step; the chat answer is excluded.
-  assert.equal(timeline.stepItems.length, 1);
-  assert.equal(timeline.stepItems[0].message.id, 'a1');
-  // The chat answer falls through to plain conversational messages.
-  assert.ok(timeline.userAndSystemMessages.some((m) => m.id === 'a2'));
-  assert.ok(!timeline.stepItems.some((item) => item.message?.id === 'a2'));
+  assert.equal(
+    timelineItemMatchesTarget(liveTimeline.stepItems[0], { runId: 'run-1', messageId: 'live-run-1' }),
+    true,
+  );
+
+  const persistedTimeline = buildStepTimeline({
+    messages: [
+      user('user-1', 'Prove this'),
+      assistant('assistant-1', 'I will first simplify the goal.', {
+        live_started_after_assistant_steps: 0,
+        live_started_after_code_steps: 0,
+      }),
+    ],
+    codeSteps: [],
+    statusEvents: [],
+    terminalMessageId: null,
+  });
+  const sections = [{ id: 'run-1', attemptNumber: 1, stepOffset: 0, timeline: persistedTimeline }];
+
+  assert.equal(timelineIndexForTarget(sections, { runId: 'run-1', messageId: 'assistant-1' }), 0);
+});
+
+test('interleaved code targets resolve to their own step instead of a previous step', () => {
+  const timeline = buildStepTimeline({
+    messages: [
+      user('user-1', 'Prove this'),
+      assistant('assistant-1', 'First attempt.'),
+      assistant('assistant-2', 'Second attempt.'),
+    ],
+    codeSteps: [
+      codeStep('code-1', 1, { created_at: '2026-06-05T19:00:03.000Z', turn: 1 }),
+      codeStep('code-2', 2, { created_at: '2026-06-05T19:00:02.000Z', turn: 2 }),
+    ],
+    statusEvents: [
+      statusEvent('status-2', 'Captured second update', 2, {
+        created_at: '2026-06-05T19:00:04.000Z',
+      }),
+      statusEvent('status-1', 'Captured first update', 1, {
+        created_at: '2026-06-05T19:00:05.000Z',
+      }),
+    ],
+    terminalMessageId: null,
+  });
+  const sections = [{ id: 'run-1', attemptNumber: 1, stepOffset: 0, timeline }];
+
+  assert.equal(timelineIndexForTarget(sections, { runId: 'run-1', codeStepId: 'code-2' }), 1);
+  assert.equal(
+    timelineItemMatchesTarget(timeline.stepItems[0], { runId: 'run-1', codeStepId: 'code-2' }),
+    false,
+  );
 });

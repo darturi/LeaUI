@@ -18,6 +18,7 @@ import {
 import { timelineStepCount } from './stepTimeline.mjs';
 import { hasResolvedProjectAssociation } from './projectAssociation.mjs';
 import { buildRunTimelineSections, timelineIndexForCodeStep } from './runAttempts';
+import { timelineIndexForTarget } from './timelineTarget.mjs';
 import {
   ChatMessage,
   CodeStep,
@@ -43,6 +44,13 @@ import {
   unassignProjectTheorem,
 } from './api';
 
+export type ActiveTimelineTarget = {
+  runId?: string;
+  codeStepId?: string;
+  messageId?: string;
+  provisionalKey?: string;
+} | null;
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
@@ -51,7 +59,7 @@ export default function App() {
   const [codeSteps, setCodeSteps] = useState<CodeStep[]>([]);
   const [isPaused, setIsPaused] = useState(false);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
-  const [activeTimelineStepIndex, setActiveTimelineStepIndex] = useState<number | null>(null);
+  const [activeTimelineTarget, setActiveTimelineTarget] = useState<ActiveTimelineTarget>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string>();
   const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
@@ -74,16 +82,17 @@ export default function App() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const selectedSessionIdRef = useRef<string | undefined>(undefined);
   const codeStepCountRef = useRef(0);
-  const activeTimelineStepIndexRef = useRef<number | null>(null);
+  const codeStepsRef = useRef<CodeStep[]>([]);
+  const activeTimelineTargetRef = useRef<ActiveTimelineTarget>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const statusEventsRef = useRef<StatusEvent[]>([]);
   const approvalEventsRef = useRef<ApprovalEvent[]>([]);
   const pendingApprovalRef = useRef<PendingApproval | undefined>(undefined);
   const selectedTerminalMessageIdRef = useRef<string | null>(null);
 
-  const setActiveTimelineStep = (stepIndex: number | null) => {
-    activeTimelineStepIndexRef.current = stepIndex;
-    setActiveTimelineStepIndex(stepIndex);
+  const setActiveTimelineStep = (target: ActiveTimelineTarget) => {
+    activeTimelineTargetRef.current = target;
+    setActiveTimelineTarget(target);
   };
 
   const terminalMessageIdForDetail = (
@@ -217,6 +226,7 @@ export default function App() {
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, selectedSession?.status]);
   messagesRef.current = messages;
+  codeStepsRef.current = codeSteps;
   statusEventsRef.current = statusEvents;
   approvalEventsRef.current = approvalEvents;
   pendingApprovalRef.current = pendingApproval;
@@ -241,6 +251,10 @@ export default function App() {
         terminalMessageId: selectedTerminalMessageId,
       }),
     [messages, codeSteps, statusEvents, approvalEvents, pendingApproval, selectedTerminalMessageId],
+  );
+  const activeTimelineStepIndex = useMemo(
+    () => timelineIndexForTarget(runTimelineSections, activeTimelineTarget),
+    [runTimelineSections, activeTimelineTarget],
   );
 
   const appendMessage = (message: ChatMessage) => {
@@ -313,7 +327,6 @@ export default function App() {
               message.role === 'assistant' &&
               !message.is_live_terminal_summary,
           ).length;
-          setActiveTimelineStep(assistantStepCount);
           const next = [
             ...current,
             {
@@ -328,6 +341,20 @@ export default function App() {
             },
           ];
           messagesRef.current = next;
+          const target = { runId: run.run_id, messageId: liveAssistantId };
+          setActiveTimelineStep(target);
+          const nextSections = buildRunTimelineSections({
+            messages: next,
+            codeSteps: codeStepsRef.current,
+            statusEvents: statusEventsRef.current,
+            approvalEvents: approvalEventsRef.current,
+            pendingApproval: pendingApprovalRef.current,
+            terminalMessageId: selectedTerminalMessageIdRef.current,
+          });
+          const timelineIndex = timelineIndexForTarget(nextSections, target);
+          if (timelineIndex !== null) {
+            setCurrentStepIndex(timelineIndex);
+          }
           return next;
         });
       });
@@ -349,17 +376,40 @@ export default function App() {
             messagesRef.current = withoutLive;
             return withoutLive;
           }
-          const next = [
-            ...withoutLive,
+          const nextMessage =
             shouldReplaceLive && liveMessage
               ? {
                   ...payload,
                   live_started_after_assistant_steps: liveMessage.live_started_after_assistant_steps,
                   live_started_after_code_steps: liveMessage.live_started_after_code_steps,
                 }
-              : payload,
+              : payload;
+          const next = [
+            ...withoutLive,
+            nextMessage,
           ];
           messagesRef.current = next;
+          const activeTarget = activeTimelineTargetRef.current;
+          if (
+            shouldReplaceLive &&
+            activeTarget?.messageId === liveAssistantId &&
+            payload.role === 'assistant'
+          ) {
+            const target = { runId: payload.run_id || run.run_id, messageId: payload.id };
+            setActiveTimelineStep(target);
+            const nextSections = buildRunTimelineSections({
+              messages: next,
+              codeSteps: codeStepsRef.current,
+              statusEvents: statusEventsRef.current,
+              approvalEvents: approvalEventsRef.current,
+              pendingApproval: pendingApprovalRef.current,
+              terminalMessageId: selectedTerminalMessageIdRef.current,
+            });
+            const timelineIndex = timelineIndexForTarget(nextSections, target);
+            if (timelineIndex !== null) {
+              setCurrentStepIndex(timelineIndex);
+            }
+          }
           return next;
         });
       });
@@ -371,6 +421,7 @@ export default function App() {
             return current;
           }
           const next = [...current, payload];
+          codeStepsRef.current = next;
           codeStepCountRef.current = next.length;
           const nextSections = buildRunTimelineSections({
             messages: messagesRef.current,
@@ -382,7 +433,7 @@ export default function App() {
           });
           const timelineIndex = timelineIndexForCodeStep(nextSections, payload.id) ?? payload.step_number - 1;
           setCurrentStepIndex(timelineIndex);
-          setActiveTimelineStep(timelineIndex);
+          setActiveTimelineStep({ runId: payload.run_id, codeStepId: payload.id });
           return next;
         });
       });
@@ -393,10 +444,16 @@ export default function App() {
           Number.isInteger(payload.step_number) && payload.step_number > 0
             ? payload.step_number
             : null;
-        const activeStepNumber =
-          activeTimelineStepIndexRef.current === null
-            ? null
-            : activeTimelineStepIndexRef.current + 1;
+        const nextSections = buildRunTimelineSections({
+          messages: messagesRef.current,
+          codeSteps: codeStepsRef.current,
+          statusEvents: statusEventsRef.current,
+          approvalEvents: approvalEventsRef.current,
+          pendingApproval: pendingApprovalRef.current,
+          terminalMessageId: selectedTerminalMessageIdRef.current,
+        });
+        const activeStepIndex = timelineIndexForTarget(nextSections, activeTimelineTargetRef.current);
+        const activeStepNumber = activeStepIndex === null ? null : activeStepIndex + 1;
         setStatusEvents((current) => {
           const next = [
             ...current,
@@ -730,6 +787,7 @@ export default function App() {
 
         <Panel defaultSize={50} minSize={30}>
           <ChatInterface
+            sessionId={selectedSessionId}
             error={error}
             isPaused={isPaused}
             isRunning={isRunning}
@@ -751,7 +809,7 @@ export default function App() {
             onRequestProjectUnassignment={handleRequestProjectUnassignment}
             theoremName={title}
             currentStepIndex={currentStepIndex}
-            activeTimelineStepIndex={activeTimelineStepIndex}
+            activeTimelineTarget={activeTimelineTarget}
             pendingApproval={pendingApproval}
             isSubmittingApproval={isSubmittingApproval}
             approvalError={approvalError}

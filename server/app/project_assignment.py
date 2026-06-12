@@ -15,6 +15,7 @@ from .project_unassignment import (
     _workspace_path,
     _workspace_rel,
 )
+from .project_usage import detect_used_project_formalizations
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,12 @@ def assign_project(session_id: str, project: dict[str, Any], config: LeaConfig) 
             context["dest_rel"],
             rewritten,
             summary=f"Moved proof into project namespace {context['project_namespace']}.",
+            used_project_formalizations=detect_used_project_formalizations(
+                project=project,
+                config=config,
+                code=rewritten,
+                proof_path=context["dest_rel"],
+            ),
         )
         message = f"Assigned {context['theorem_name']} to {project['title']} and moved it to {context['dest_rel']}."
         store.add_message(session_id, "system", message, context["run_id"])

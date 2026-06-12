@@ -69,6 +69,8 @@ export interface CodeStep {
   kind?: 'code' | 'no_code';
   summary?: string | null;
   turn?: number | null;
+  used_project_formalizations?: ProjectFormalizationUse[];
+  used_by_project_formalizations?: ProjectFormalizationUse[];
   created_at: string;
 }
 
@@ -80,6 +82,18 @@ export interface StatusEvent {
   status?: string | null;
   message: string;
   created_at: string;
+}
+
+export interface UsageUpdatedEvent {
+  session_id: string;
+  run_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  delta_input_tokens: number;
+  delta_output_tokens: number;
+  delta_cost_usd: number;
 }
 
 export interface UsageBreakdownRow {
@@ -128,6 +142,13 @@ export interface ProjectTheoremEntry {
   name: string;
   proof_path: string;
   module_name?: string | null;
+}
+
+export interface ProjectFormalizationUse extends ProjectTheoremEntry {
+  project_id?: string | null;
+  project_slug?: string | null;
+  project_title?: string | null;
+  project_path?: string | null;
 }
 
 export interface ProjectUnassignmentMove {
