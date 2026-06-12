@@ -2,6 +2,9 @@ function isAssistantStepMessage(message, terminalMessageId) {
   if (message.role !== 'assistant') return false;
   if (message.id === terminalMessageId) return false;
   if (message.is_live_terminal_summary) return false;
+  // Conversational answers (explain/QA turns) are plain chat bubbles, not numbered
+  // proof steps — they have no paired code snapshot.
+  if (message.kind === 'chat') return false;
   return true;
 }
 

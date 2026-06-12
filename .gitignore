@@ -8,3 +8,7 @@ __pycache__/
 data/
 config/lea.local.toml
 
+# Local working notes / agent instructions — not part of the shipped repo
+CLAUDE.md
+TODO.md
+

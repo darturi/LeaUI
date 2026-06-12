@@ -180,3 +180,24 @@ test('unnumbered operational logs attach to the nearest step instead of setup', 
   assert.deepEqual(timeline.globalLogs.map((log) => log.id), ['status-setup']);
   assert.deepEqual(timeline.stepItems[0].logs.map((log) => log.id), ['status-tool']);
 });
+
+test('chat-kind assistant messages are not numbered steps', () => {
+  const timeline = buildStepTimeline({
+    messages: [
+      user('u1', 'prove demo'),
+      assistant('a1', 'Wrote the proof.'),
+      user('u2', 'explain this proof'),
+      assistant('a2', 'It uses `trivial` to close `True`.', { kind: 'chat' }),
+    ],
+    codeSteps: [codeStep('c1', 1)],
+    statusEvents: [],
+    terminalMessageId: null,
+  });
+
+  // Only the real proof narration is a step; the chat answer is excluded.
+  assert.equal(timeline.stepItems.length, 1);
+  assert.equal(timeline.stepItems[0].message.id, 'a1');
+  // The chat answer falls through to plain conversational messages.
+  assert.ok(timeline.userAndSystemMessages.some((m) => m.id === 'a2'));
+  assert.ok(!timeline.stepItems.some((item) => item.message?.id === 'a2'));
+});

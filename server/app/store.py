@@ -299,6 +299,25 @@ def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
         )
 
 
+def set_session_api_session_id(session_id: str, api_session_id: str) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update sessions set api_session_id = ?, updated_at = ? where id = ?",
+            (api_session_id, now, session_id),
+        )
+
+
+def set_run_messages_kind(run_id: str, kind: str, role: str = "assistant") -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update messages set kind = ? where run_id = ? and role = ?",
+            (kind, run_id, role),
+        )
+        conn.execute("update runs set updated_at = ? where id = ?", (now, run_id))
+
+
 def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None:
     now = utc_now()
     value = json.dumps(pending_approval) if pending_approval is not None else None
@@ -315,16 +334,22 @@ def get_run(run_id: str) -> dict | None:
     return _normalize_run(row_to_dict(row)) if row else None
 
 
-def add_message(session_id: str, role: str, content: str, run_id: str | None = None) -> dict:
+def add_message(
+    session_id: str,
+    role: str,
+    content: str,
+    run_id: str | None = None,
+    kind: str = "assistant",
+) -> dict:
     now = utc_now()
     message_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into messages (id, session_id, run_id, role, content, created_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into messages (id, session_id, run_id, role, content, kind, created_at)
+            values (?, ?, ?, ?, ?, ?, ?)
             """,
-            (message_id, session_id, run_id, role, content, now),
+            (message_id, session_id, run_id, role, content, kind, now),
         )
         row = conn.execute("select * from messages where id = ?", (message_id,)).fetchone()
     touch_session(session_id)

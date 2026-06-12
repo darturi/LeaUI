@@ -30,13 +30,20 @@ class LeaApiClient:
         self.config = config
         self.transport = transport or (lambda request, timeout=None: urlopen(request, timeout=timeout))
 
-    def start_run(self, task: str, project: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start_run(
+        self,
+        task: str,
+        project: dict[str, Any] | None = None,
+        resume: bool | str = False,
+    ) -> dict[str, Any]:
         payload = {
             "task": task,
             "config": self._run_config(),
         }
         if project is not None:
             payload["project"] = project
+        if resume:
+            payload["resume"] = resume
         response = self._json_request("/v1/runs", method="POST", body=payload)
         if not isinstance(response.body, dict) or not response.body.get("run_id"):
             raise LeaApiError("Lea API did not return a run_id.")
@@ -127,6 +134,7 @@ class LeaApiClient:
     def _run_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
             "agent": {
+                "prompt_variant": "interactive",
                 "max_turns": self.config.max_turns,
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
@@ -140,6 +148,7 @@ class LeaApiClient:
                 config["model"]["model_kwargs"] = model_kwargs
         if self.config.max_turns is None:
             config["agent"] = {
+                "prompt_variant": "interactive",
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
                 "theorem_translation_max_retries": self.config.theorem_translation_max_retries,

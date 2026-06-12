@@ -89,7 +89,10 @@ export function ChatInterface({
     }
     const terminalMessage = [...messages]
       .reverse()
-      .find((message) => message.role === 'assistant' || message.role === 'system');
+      .find(
+        (message) =>
+          (message.role === 'assistant' || message.role === 'system') && message.kind !== 'chat',
+      );
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, sessionStatus]);
   const runSections = useMemo(() => {

@@ -247,6 +247,32 @@ def create_run(request: RunRequest) -> dict:
     }
 
 
+_TRANSLATION_APPROVAL_MARKER = "-theorem-translation-"
+
+
+def _cleanup_translation_proposals(approval_id: str, config) -> None:
+    """Best-effort removal of throwaway theorem-translation proposal files.
+
+    The Lea prover writes each preflight skeleton to
+    ``<lea_root>/workspace/proofs/.lea_proposals/<session>_theorem_translation_<n>.lean``
+    purely as a ``lean_check`` target. The ``approval_id`` is
+    ``<session>-theorem-translation-<candidate>``, so we can recover the session
+    prefix and drop the whole session's candidates. Once accepted the prover
+    uses the in-memory code and never reads these files again, so deletion is
+    safe and never fails the request.
+    """
+    idx = approval_id.rfind(_TRANSLATION_APPROVAL_MARKER)
+    if idx <= 0 or config.lea_root is None:
+        return
+    session_prefix = approval_id[:idx]
+    proposals_dir = config.lea_root / "workspace" / "proofs" / ".lea_proposals"
+    try:
+        for path in proposals_dir.glob(f"{session_prefix}_theorem_translation_*.lean"):
+            path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to clean up theorem-translation proposals: %s", exc)
+
+
 @app.post("/api/runs/{run_id}/approvals/{approval_id}")
 def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionRequest) -> dict:
     if request.decision not in {"accept", "reject"}:
@@ -262,8 +288,9 @@ def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionReq
     if not api_run_id:
         raise HTTPException(status_code=409, detail="Run is not ready for approval")
 
+    config = load_config()
     try:
-        return LeaApiClient(load_config()).resolve_approval(
+        result = LeaApiClient(config).resolve_approval(
             str(api_run_id),
             approval_id,
             request.decision,
@@ -272,6 +299,10 @@ def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionReq
     except LeaApiError as exc:
         status_code = exc.status if exc.status in {400, 401, 403, 404, 409, 422} else 502
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    if request.decision == "accept":
+        _cleanup_translation_proposals(approval_id, config)
+    return result
 
 
 def sse(event_type: str, payload: dict) -> str:

@@ -36,6 +36,7 @@ def init_db() -> None:
                 project_id text references projects(id),
                 title text not null,
                 status text not null,
+                api_session_id text,
                 created_at text not null,
                 updated_at text not null
             );
@@ -72,6 +73,7 @@ def init_db() -> None:
                 run_id text references runs(id),
                 role text not null,
                 content text not null,
+                kind text not null default 'assistant',
                 created_at text not null
             );
 
@@ -146,6 +148,15 @@ def init_db() -> None:
         }
         if "project_id" not in session_columns:
             conn.execute("alter table sessions add column project_id text references projects(id)")
+        if "api_session_id" not in session_columns:
+            conn.execute("alter table sessions add column api_session_id text")
+
+        message_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(messages)").fetchall()
+        }
+        if "kind" not in message_columns:
+            conn.execute("alter table messages add column kind text not null default 'assistant'")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:

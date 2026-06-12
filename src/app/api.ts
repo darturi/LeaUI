@@ -52,6 +52,7 @@ export interface ChatMessage {
   run_id?: string | null;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  kind?: 'assistant' | 'chat' | string;
   created_at: string;
   is_live_terminal_summary?: boolean;
   live_started_after_assistant_steps?: number;

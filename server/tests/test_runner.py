@@ -1337,3 +1337,54 @@ def test_max_turns_persists_partial_assistant_text_before_system_notice(tmp_path
     assert persisted[-2]["content"] == "I will try induction.\nThe base case is straightforward."
     assert persisted[-1]["role"] == "system"
     assert persisted[-1]["content"] == "Error: max turns reached."
+
+
+class ResumeAwareClient(FakeLeaApiClient):
+    """FakeLeaApiClient whose start_run records the project/resume kwargs."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.start_kwargs = None
+
+    def start_run(self, task, project=None, resume=False):
+        self.start_kwargs = {"task": task, "project": project, "resume": resume}
+        if self.fail_start:
+            raise self.fail_start
+        return {"run_id": "api-run-1"}
+
+
+def test_assistant_turn_renders_as_chat_and_resumes(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = ResumeAwareClient(
+        events=[
+            {"seq": 0, "type": "session_resumed", "session_id": "agent-sess-9", "message_count": 4},
+            {"seq": 1, "type": "assistant_text_delta", "text": "This proof closes `True` with `trivial`."},
+            {
+                "seq": 2,
+                "type": "finished",
+                "reason": "assistant",
+                "session_id": "agent-sess-9",
+                "text": "This proof closes `True` with `trivial`.",
+            },
+        ],
+        status={"status": "completed", "result": {"reason": "assistant"}, "session_id": "agent-sess-9"},
+        transcript={"messages": []},
+    )
+    context = make_context(tmp_path, client)
+    # Simulate a prior proof run having captured the agent session.
+    store.set_session_api_session_id(context.session_id, "agent-sess-9")
+
+    run_lea(context)
+
+    # Resume was forwarded to the Lea API.
+    assert client.start_kwargs["resume"] == "agent-sess-9"
+    # A QA/explain turn must NOT be marked failed for lacking a proof/lean_check.
+    assert store.get_run(context.run_id)["status"] == "success"
+    # The answer is persisted as a plain chat bubble, not a numbered proof step.
+    detail = store.session_detail(context.session_id)
+    chat_messages = [m for m in detail["messages"] if m.get("kind") == "chat"]
+    assert chat_messages, "expected a chat-kind assistant message"
+    assert "trivial" in chat_messages[-1]["content"]
+    assert detail["code_steps"] == []
+    # The agent session id is persisted so the next turn keeps resuming it.
+    assert store.get_session(context.session_id)["api_session_id"] == "agent-sess-9"
