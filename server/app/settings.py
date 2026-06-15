@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ROOT, LeaConfig, load_config
+from .config import ROOT, LEGACY_KEY_ENV, LeaConfig, load_config
+from . import models_catalog
 from . import store
 
 
@@ -26,16 +27,16 @@ PROVIDER_LABELS = {
     "anthropic": "Anthropic",
     "google": "Google",
 }
+# Curated shortlist of current models. Not exhaustive — the Settings model field
+# is a searchable combobox that also accepts any custom model ID (provider is
+# inferred from the ID prefix), so models not listed here can still be typed in.
 MODEL_OPTIONS = [
-    {"value": "gpt-4o", "label": "GPT-4o", "family": "openai"},
-    {"value": "gpt-4o-mini", "label": "GPT-4o Mini", "family": "openai"},
-    {"value": "gpt-4-turbo", "label": "GPT-4 Turbo", "family": "openai"},
-    {"value": "claude-opus-4-7", "label": "Claude Opus 4.7", "family": "anthropic"},
+    {"value": "gpt-5.5", "label": "GPT-5.5", "family": "openai"},
+    {"value": "gpt-5.5-mini", "label": "GPT-5.5 Mini", "family": "openai"},
+    {"value": "claude-opus-4-8", "label": "Claude Opus 4.8", "family": "anthropic"},
     {"value": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "family": "anthropic"},
     {"value": "claude-haiku-4-5", "label": "Claude Haiku 4.5", "family": "anthropic"},
-    {"value": "gemini-2.0-flash", "label": "Gemini 2.0 Flash", "family": "google"},
-    {"value": "gemini-1.5-pro", "label": "Gemini 1.5 Pro", "family": "google"},
-    {"value": "gemini/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview", "family": "google"},
+    {"value": "gemini/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro", "family": "google"},
 ]
 MODEL_FAMILY_BY_VALUE = {str(option["value"]): str(option["family"]) for option in MODEL_OPTIONS}
 KEY_VALIDATORS = {
@@ -43,6 +44,38 @@ KEY_VALIDATORS = {
     "anthropic": re.compile(r"^sk-ant-.+"),
     "google": re.compile(r"^AIza[A-Za-z0-9_-]{20,}$"),
 }
+
+# The three "first-class" providers — their env vars route to legacy flat TOML
+# keys and get live key verification. Everything else (Mistral, HuggingFace, …)
+# is stored under its uppercase env var name and saved without live verification.
+FAMILY_ENV = {family: env for env, family in {
+    "GOOGLE_API_KEY": "google",
+    "ANTHROPIC_API_KEY": "anthropic",
+    "OPENAI_API_KEY": "openai",
+}.items()}
+ENV_FAMILY = {env: family for family, env in FAMILY_ENV.items()}
+
+# Display labels for common env vars; unknown ones derive a label from the name.
+KNOWN_KEY_LABELS = {
+    "OPENAI_API_KEY": "OpenAI",
+    "ANTHROPIC_API_KEY": "Anthropic",
+    "GOOGLE_API_KEY": "Google",
+    "GEMINI_API_KEY": "Gemini",
+    "MISTRAL_API_KEY": "Mistral",
+    "HUGGINGFACE_API_KEY": "HuggingFace",
+    "COHERE_API_KEY": "Cohere",
+    "DEEPSEEK_API_KEY": "DeepSeek",
+    "GROQ_API_KEY": "Groq",
+    "TOGETHERAI_API_KEY": "Together AI",
+    "XAI_API_KEY": "xAI",
+    "PERPLEXITYAI_API_KEY": "Perplexity",
+}
+
+
+def _key_label(env_name: str) -> str:
+    if env_name in KNOWN_KEY_LABELS:
+        return KNOWN_KEY_LABELS[env_name]
+    return env_name.removesuffix("_API_KEY").replace("_", " ").title() or env_name
 
 
 class SettingsValidationError(ValueError):
@@ -67,16 +100,71 @@ def settings_payload(path: Path | None = None) -> dict[str, Any]:
         "permission_tier": config.permission_tier,
         "theorem_translation_max_retries": config.theorem_translation_max_retries,
         "current_spend_usd": float(stats["global"]["cost_usd"]),
-        "api_keys": {
-            family: _masked_key(getattr(config, field))
-            for family, field in API_KEY_FIELDS.items()
-        },
+        "api_keys": _api_keys_payload(config),
         "model_options": MODEL_OPTIONS,
         "permission_tiers": [
             {"value": "none", "label": "Fully autonomous"},
             {"value": "theorem_translation", "label": "Approve theorem formalization"},
             {"value": "stepwise", "label": "Approve each agent step"},
         ],
+    }
+
+
+def _api_keys_payload(config: LeaConfig) -> dict[str, Any]:
+    """Env-var-keyed key status. Always includes the three first-class providers
+    (so they show in the UI) plus any additional providers already configured."""
+    env_names = list(ENV_FAMILY.keys())
+    for env in config.api_keys:
+        if env not in env_names:
+            env_names.append(env)
+    return {
+        env: {**_masked_key(config.api_keys.get(env)), "label": _key_label(env)}
+        for env in env_names
+    }
+
+
+def model_catalog() -> list[dict[str, str]]:
+    """Full LiteLLM chat-model catalog for the searchable picker; falls back to
+    the curated shortlist if LiteLLM is unavailable."""
+    catalog = models_catalog.list_chat_models()
+    if catalog:
+        return catalog
+    return [
+        {"value": str(o["value"]), "label": str(o["label"]), "provider": str(o["family"])}
+        for o in MODEL_OPTIONS
+    ]
+
+
+def _required_env_keys(model: str) -> list[str]:
+    if models_catalog.is_available():
+        keys = models_catalog.requirements_for(model).get("required_keys") or []
+        if keys:
+            return list(keys)
+    family = _model_family(model)
+    if family and family in FAMILY_ENV:
+        return [FAMILY_ENV[family]]
+    return []
+
+
+def model_requirements(model: str, path: Path | None = None) -> dict[str, Any]:
+    """Which key(s) a model needs and whether they're configured — drives the
+    dynamic API-key prompt in Settings."""
+    config = load_config(path)
+    required = _required_env_keys(model)
+    configured = set(config.api_keys.keys())
+    provider = None
+    if models_catalog.is_available():
+        provider = models_catalog.requirements_for(model).get("provider")
+    if not provider:
+        provider = _model_family(model)
+    return {
+        "model": model,
+        "provider": provider,
+        "required_keys": [
+            {"env": env, "label": _key_label(env), "configured": env in configured}
+            for env in required
+        ],
+        "satisfied": (not required) or any(env in configured for env in required),
     }
 
 
@@ -128,30 +216,40 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
                 raise ValueError("max_spend_usd must be greater than or equal to 0")
             updates["max_spend_usd"] = max_spend_float
 
+    # api_keys is keyed by LiteLLM env var name (OPENAI_API_KEY, MISTRAL_API_KEY,
+    # …). The three first-class providers route to their legacy flat TOML keys
+    # and get live verification; any other provider is saved under its env var
+    # name as-is.
     api_key_updates = values.get("api_keys") or {}
     if not isinstance(api_key_updates, dict):
         raise ValueError("api_keys must be an object")
-    for family, field in API_KEY_FIELDS.items():
-        raw_update = api_key_updates.get(family)
+    selected_model = str(updates.get("model", current_config.model))
+    for env_name, raw_update in api_key_updates.items():
         if raw_update is None:
             continue
         if not isinstance(raw_update, dict):
-            raise ValueError(f"api_keys.{family} must be an object")
+            raise ValueError(f"api_keys.{env_name} must be an object")
+        env_name = str(env_name)
+        family = ENV_FAMILY.get(env_name)
+        toml_key = API_KEY_FIELDS[family] if family else env_name
         if raw_update.get("clear"):
-            updates[field] = None
+            updates[toml_key] = None
             continue
         value = raw_update.get("value")
-        if value is not None:
-            value = str(value).strip()
-            if value:
-                _validate_api_key_format(family, value)
-                _verify_api_key_credentials(
-                    family,
-                    value,
-                    current_config,
-                    str(updates.get("model", current_config.model)),
-                )
-                updates[field] = value
+        if value is None:
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        if family:
+            _validate_api_key_format(family, value)
+            _verify_api_key_credentials(family, value, current_config, selected_model)
+        elif not re.fullmatch(r"[A-Z][A-Z0-9_]*_API_KEY", env_name):
+            raise SettingsValidationError(
+                f"{env_name} is not a recognized API key name.",
+                f"api_keys.{env_name}",
+            )
+        updates[toml_key] = value
 
     _validate_selected_model_has_key(current_config, updates)
     _write_toml_updates(config_path, updates)
@@ -174,26 +272,40 @@ def _masked_key(value: str | None) -> dict[str, Any]:
     return {"configured": True, "last4": value[-4:] if len(value) >= 4 else value}
 
 
+def _configured_env_keys_after(config: LeaConfig, updates: dict[str, Any]) -> set[str]:
+    """Env-var key names that will be configured once `updates` are written."""
+    keys = set(config.api_keys.keys())
+    for toml_key, value in updates.items():
+        if toml_key in LEGACY_KEY_ENV:
+            env = LEGACY_KEY_ENV[toml_key]
+        elif re.fullmatch(r"[A-Z][A-Z0-9_]*_API_KEY", toml_key):
+            env = toml_key
+        else:
+            continue
+        keys.add(env) if value else keys.discard(env)
+    return keys
+
+
 def _validate_selected_model_has_key(config: LeaConfig, updates: dict[str, Any]) -> None:
     model = str(updates.get("model", config.model))
-    family = _model_family(model)
-    if family is None:
+    required = _required_env_keys(model)
+    if not required:
         return
-    field = API_KEY_FIELDS[family]
-    key = updates[field] if field in updates else getattr(config, field)
-    if not key:
-        raise SettingsValidationError(
-            f"An API key for {_provider_label(family)} is required before saving this model.",
-            f"api_keys.{family}",
-        )
-    _validate_api_key_format(family, str(key))
+    configured = _configured_env_keys_after(config, updates)
+    if any(env in configured for env in required):
+        return
+    env = required[0]
+    raise SettingsValidationError(
+        f"An API key ({_key_label(env)}) is required before saving this model.",
+        f"api_keys.{env}",
+    )
 
 
 def _model_family(model: str) -> str | None:
     if model in MODEL_FAMILY_BY_VALUE:
         return MODEL_FAMILY_BY_VALUE[model]
     normalized = model.lower()
-    if normalized.startswith(("gpt-", "o1", "o3", "o4", "openai/")):
+    if normalized.startswith(("gpt-", "openai/")) or re.match(r"^o\d", normalized):
         return "openai"
     if normalized.startswith(("claude-", "anthropic/")):
         return "anthropic"

@@ -66,6 +66,7 @@ def test_start_run_posts_task_config_and_bearer_auth():
         "task": "prove True",
         "config": {
             "agent": {
+                "prompt_variant": "interactive",
                 "max_turns": 5,
                 "narrate_tool_steps": False,
                 "permission_tier": "none",
@@ -74,6 +75,7 @@ def test_start_run_posts_task_config_and_bearer_auth():
             "model": {"name": "o4-mini"},
         },
     }
+    assert "resume" not in seen["body"]
 
 
 def test_start_run_sends_narration_flag_even_without_max_turns():
@@ -86,10 +88,36 @@ def test_start_run_sends_narration_flag_even_without_max_turns():
     LeaApiClient(make_config(max_turns=None, narrate_tool_steps=True), transport=transport).start_run("task")
 
     assert seen["body"]["config"]["agent"] == {
+        "prompt_variant": "interactive",
         "narrate_tool_steps": True,
         "permission_tier": "none",
         "theorem_translation_max_retries": 3,
     }
+
+
+def test_start_run_includes_resume_when_provided():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"run_id": "api-1"}).encode("utf-8"))
+
+    LeaApiClient(make_config(), transport=transport).start_run("task", resume="20260611-120000")
+
+    assert seen["body"]["resume"] == "20260611-120000"
+    assert seen["body"]["config"]["agent"]["prompt_variant"] == "interactive"
+
+
+def test_start_run_omits_resume_when_falsey():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"run_id": "api-1"}).encode("utf-8"))
+
+    LeaApiClient(make_config(), transport=transport).start_run("task", resume=False)
+
+    assert "resume" not in seen["body"]
 
 
 def test_start_run_sends_permission_tier():

@@ -2,33 +2,23 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Check, Eye, EyeOff, KeyRound, RotateCcw, Save, Settings, X } from 'lucide-react';
 import {
   AppSettings,
+  ApiKeyStatus,
+  ModelCatalogEntry,
+  ModelRequirements,
   PermissionTier,
   SettingsUpdate,
+  fetchModelCatalog,
+  fetchModelRequirements,
   getSettings,
   saveSettings,
 } from '../api';
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue,
-} from './ui/select';
+import { ModelCombobox } from './ModelCombobox';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';
 import { Progress } from './ui/progress';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Separator } from './ui/separator';
-
-const MODEL_FAMILIES = [
-  { key: 'openai', label: 'OpenAI', placeholder: 'sk-...' },
-  { key: 'anthropic', label: 'Anthropic', placeholder: 'sk-ant-...' },
-  { key: 'google', label: 'Google AI', placeholder: 'AIza...' },
-] as const;
 
 const PERMISSION_DETAILS: Record<PermissionTier, { title: string; description: string }> = {
   none: {
@@ -45,12 +35,24 @@ const PERMISSION_DETAILS: Record<PermissionTier, { title: string; description: s
   },
 };
 
-type ApiKeyFamily = (typeof MODEL_FAMILIES)[number]['key'];
-const API_KEY_PATTERNS: Record<ApiKeyFamily, RegExp> = {
-  openai: /^sk-[A-Za-z0-9_-]{8,}$/,
-  anthropic: /^sk-ant-.+/,
-  google: /^AIza[A-Za-z0-9_-]{20,}$/,
+// Client-side format hints for the first-class providers; other providers are
+// validated by the backend / provider at runtime.
+const KEY_PATTERNS: Record<string, RegExp> = {
+  OPENAI_API_KEY: /^sk-[A-Za-z0-9_-]{8,}$/,
+  ANTHROPIC_API_KEY: /^sk-ant-.+/,
+  GOOGLE_API_KEY: /^AIza[A-Za-z0-9_-]{20,}$/,
 };
+const KEY_PLACEHOLDERS: Record<string, string> = {
+  OPENAI_API_KEY: 'sk-...',
+  ANTHROPIC_API_KEY: 'sk-ant-...',
+  GOOGLE_API_KEY: 'AIza...',
+};
+
+interface KeyField {
+  env: string;
+  label: string;
+  status?: ApiKeyStatus;
+}
 
 export function SettingsPage({ onBack }: { onBack: () => void }) {
   const [settings, setSettings] = useState<AppSettings>();
@@ -59,21 +61,11 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
   const [theoremTranslationRetries, setTheoremTranslationRetries] = useState(3);
   const [maxTurns, setMaxTurns] = useState(20);
   const [maxSpend, setMaxSpend] = useState('');
-  const [apiKeys, setApiKeys] = useState<Record<ApiKeyFamily, string>>({
-    openai: '',
-    anthropic: '',
-    google: '',
-  });
-  const [clearedKeys, setClearedKeys] = useState<Record<ApiKeyFamily, boolean>>({
-    openai: false,
-    anthropic: false,
-    google: false,
-  });
-  const [visibleKeys, setVisibleKeys] = useState<Record<ApiKeyFamily, boolean>>({
-    openai: false,
-    anthropic: false,
-    google: false,
-  });
+  const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
+  const [clearedKeys, setClearedKeys] = useState<Record<string, boolean>>({});
+  const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
+  const [catalog, setCatalog] = useState<ModelCatalogEntry[]>([]);
+  const [requirements, setRequirements] = useState<ModelRequirements>();
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -91,8 +83,8 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
       setTheoremTranslationRetries(loaded.theorem_translation_max_retries);
       setMaxTurns(loaded.max_turns ?? 20);
       setMaxSpend(loaded.max_spend_usd == null ? '' : String(loaded.max_spend_usd));
-      setApiKeys({ openai: '', anthropic: '', google: '' });
-      setClearedKeys({ openai: false, anthropic: false, google: false });
+      setApiKeys({});
+      setClearedKeys({});
       setFieldErrors({});
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load settings.');
@@ -103,7 +95,31 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
 
   useEffect(() => {
     void load();
+    // The full model catalog is best-effort — a blank list just falls back to
+    // the featured shortlist in the combobox.
+    fetchModelCatalog()
+      .then(setCatalog)
+      .catch(() => setCatalog([]));
   }, []);
+
+  // Look up which API key(s) the selected model needs, so the right field shows.
+  useEffect(() => {
+    if (!model.trim()) {
+      setRequirements(undefined);
+      return;
+    }
+    let cancelled = false;
+    fetchModelRequirements(model)
+      .then((req) => {
+        if (!cancelled) setRequirements(req);
+      })
+      .catch(() => {
+        if (!cancelled) setRequirements(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [model]);
 
   const currentSpend = settings?.current_spend_usd ?? 0;
   const maxSpendValue = Number(maxSpend);
@@ -115,24 +131,41 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
       ? '[&_[data-slot=progress-indicator]]:bg-yellow-500'
       : '[&_[data-slot=progress-indicator]]:bg-primary';
 
-  const groupedModels = useMemo(() => {
-    const options = settings?.model_options || [];
-    return MODEL_FAMILIES.map((family) => ({
-      ...family,
-      models: options.filter((option) => option.family === family.key),
-    }));
-  }, [settings?.model_options]);
-  const selectedModelFamily = useMemo(
-    () => modelFamilyFor(model, settings) as ApiKeyFamily | undefined,
-    [model, settings],
+  // The API-key fields to render: every configured provider plus any key the
+  // selected model requires (so a newly-needed provider's field appears).
+  const keyFields = useMemo<KeyField[]>(() => {
+    const fields: KeyField[] = [];
+    const seen = new Set<string>();
+    for (const [env, status] of Object.entries(settings?.api_keys || {})) {
+      fields.push({ env, label: status.label, status });
+      seen.add(env);
+    }
+    for (const req of requirements?.required_keys || []) {
+      if (!seen.has(req.env)) {
+        fields.push({ env: req.env, label: req.label });
+        seen.add(req.env);
+      }
+    }
+    return fields;
+  }, [settings, requirements]);
+
+  const requiredKeys = requirements?.required_keys || [];
+  // A model's key requirement is a group: any one of the acceptable env vars
+  // satisfies it (e.g. Gemini via GOOGLE_API_KEY or GEMINI_API_KEY).
+  const keyMissing =
+    requiredKeys.length > 0 &&
+    !requiredKeys.some((k) => (k.configured && !clearedKeys[k.env]) || apiKeys[k.env]?.trim());
+  // Only badge fields "Required" while the requirement is actually unmet.
+  const requiredEnvs = useMemo(
+    () => new Set(keyMissing ? requiredKeys.map((k) => k.env) : []),
+    [keyMissing, requiredKeys],
   );
-  const selectedFamilyLabel = MODEL_FAMILIES.find((family) => family.key === selectedModelFamily)?.label;
 
   const submit = async () => {
     setError(undefined);
     setFieldErrors({});
     setSaved(false);
-    const localErrors = validateSettingsBeforeSave(settings, model, selectedModelFamily, apiKeys, clearedKeys);
+    const localErrors = validateBeforeSave(keyFields, apiKeys, keyMissing, requiredKeys[0], model);
     if (Object.keys(localErrors).length > 0) {
       setFieldErrors(localErrors);
       setError(Object.values(localErrors)[0]);
@@ -140,13 +173,13 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
     }
     setIsSaving(true);
     try {
-      const apiKeyUpdates: SettingsUpdate['api_keys'] = {};
-      for (const family of MODEL_FAMILIES) {
-        const value = apiKeys[family.key].trim();
+      const apiKeyUpdates: NonNullable<SettingsUpdate['api_keys']> = {};
+      for (const field of keyFields) {
+        const value = (apiKeys[field.env] || '').trim();
         if (value) {
-          apiKeyUpdates[family.key] = { value };
-        } else if (clearedKeys[family.key]) {
-          apiKeyUpdates[family.key] = { clear: true };
+          apiKeyUpdates[field.env] = { value };
+        } else if (clearedKeys[field.env]) {
+          apiKeyUpdates[field.env] = { clear: true };
         }
       }
       const update: SettingsUpdate = {
@@ -164,8 +197,8 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
       setTheoremTranslationRetries(savedSettings.theorem_translation_max_retries);
       setMaxTurns(savedSettings.max_turns ?? 20);
       setMaxSpend(savedSettings.max_spend_usd == null ? '' : String(savedSettings.max_spend_usd));
-      setApiKeys({ openai: '', anthropic: '', google: '' });
-      setClearedKeys({ openai: false, anthropic: false, google: false });
+      setApiKeys({});
+      setClearedKeys({});
       setFieldErrors({});
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
@@ -217,38 +250,37 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
           </div>
         ) : (
           <div className="rounded-md border border-border bg-card">
-            <Section title="Model" description="Backend model used for proof formalization.">
-              <Select value={model} onValueChange={setModel}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Select model" />
-                </SelectTrigger>
-                <SelectContent>
-                  {groupedModels.map((family, index) => (
-                    <SelectGroup key={family.key}>
-                      <SelectLabel>{family.label}</SelectLabel>
-                      {family.models.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          {option.label}
-                        </SelectItem>
-                      ))}
-                      {index < groupedModels.length - 1 && <SelectSeparator />}
-                    </SelectGroup>
-                  ))}
-                </SelectContent>
-              </Select>
+            <Section
+              title="Model"
+              description="Backend model used for proof formalization. Search the full provider catalog or type any model ID — you'll be prompted for that provider's API key below."
+            >
+              <ModelCombobox
+                value={model}
+                onChange={setModel}
+                catalog={catalog}
+                featured={settings?.model_options || []}
+              />
             </Section>
 
             <Separator />
 
-            <Section title="API Keys" description="Configured keys stay in the local backend config.">
+            <Section title="API Keys" description="Configured keys stay in the local backend config. The key for the selected model is required.">
               <div className="space-y-4">
-                {MODEL_FAMILIES.map((family) => {
-                  const status = settings?.api_keys[family.key];
-                  const configured = Boolean(status?.configured) && !clearedKeys[family.key];
+                {keyFields.map((field) => {
+                  const status = field.status;
+                  const configured = Boolean(status?.configured) && !clearedKeys[field.env];
+                  const placeholder = KEY_PLACEHOLDERS[field.env] || 'Enter API key';
                   return (
-                    <div key={family.key} className="space-y-2">
+                    <div key={field.env} className="space-y-2">
                       <div className="flex items-center justify-between gap-3">
-                        <Label htmlFor={`${family.key}-api-key`}>{family.label}</Label>
+                        <Label htmlFor={`${field.env}-api-key`} className="flex items-center gap-2">
+                          {field.label}
+                          {requiredEnvs.has(field.env) && (
+                            <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium uppercase text-primary">
+                              Required
+                            </span>
+                          )}
+                        </Label>
                         {configured && (
                           <span className="flex items-center gap-1 text-xs text-muted-foreground">
                             <KeyRound className="h-3.5 w-3.5" />
@@ -259,50 +291,50 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
                       <div className="flex gap-2">
                         <div className="relative flex-1">
                           <Input
-                            id={`${family.key}-api-key`}
-                            type={visibleKeys[family.key] ? 'text' : 'password'}
-                            value={apiKeys[family.key]}
-                            placeholder={configured ? 'Enter a new key to replace the saved key' : family.placeholder}
+                            id={`${field.env}-api-key`}
+                            type={visibleKeys[field.env] ? 'text' : 'password'}
+                            value={apiKeys[field.env] || ''}
+                            placeholder={configured ? 'Enter a new key to replace the saved key' : placeholder}
                             onChange={(event) =>
-                              setApiKeys((current) => ({ ...current, [family.key]: event.target.value }))
+                              setApiKeys((current) => ({ ...current, [field.env]: event.target.value }))
                             }
                             className="pr-10 font-mono"
                           />
                           <button
                             type="button"
                             onClick={() =>
-                              setVisibleKeys((current) => ({ ...current, [family.key]: !current[family.key] }))
+                              setVisibleKeys((current) => ({ ...current, [field.env]: !current[field.env] }))
                             }
                             className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-                            aria-label={`Toggle ${family.label} key visibility`}
-                            title={`Toggle ${family.label} key visibility`}
+                            aria-label={`Toggle ${field.label} key visibility`}
+                            title={`Toggle ${field.label} key visibility`}
                           >
-                            {visibleKeys[family.key] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                            {visibleKeys[field.env] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                           </button>
                         </div>
                         {status?.configured && (
                           <button
                             type="button"
                             onClick={() =>
-                              setClearedKeys((current) => ({ ...current, [family.key]: !current[family.key] }))
+                              setClearedKeys((current) => ({ ...current, [field.env]: !current[field.env] }))
                             }
                             className={[
                               'flex h-9 w-9 items-center justify-center rounded-md border transition-colors',
-                              clearedKeys[family.key]
+                              clearedKeys[field.env]
                                 ? 'border-destructive/40 bg-destructive/10 text-destructive'
                                 : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
                             ].join(' ')}
-                            aria-label={clearedKeys[family.key] ? `Keep ${family.label} key` : `Clear ${family.label} key`}
-                            title={clearedKeys[family.key] ? `Keep ${family.label} key` : `Clear ${family.label} key`}
+                            aria-label={clearedKeys[field.env] ? `Keep ${field.label} key` : `Clear ${field.label} key`}
+                            title={clearedKeys[field.env] ? `Keep ${field.label} key` : `Clear ${field.label} key`}
                           >
-                            {clearedKeys[family.key] ? <RotateCcw className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                            {clearedKeys[field.env] ? <RotateCcw className="h-4 w-4" /> : <X className="h-4 w-4" />}
                           </button>
                         )}
                       </div>
-                      {fieldErrors[`api_keys.${family.key}`] && (
-                        <p className="text-xs text-destructive">{fieldErrors[`api_keys.${family.key}`]}</p>
+                      {fieldErrors[`api_keys.${field.env}`] && (
+                        <p className="text-xs text-destructive">{fieldErrors[`api_keys.${field.env}`]}</p>
                       )}
-                      {clearedKeys[family.key] && (
+                      {clearedKeys[field.env] && (
                         <p className="text-xs text-destructive">This saved key will be removed on save.</p>
                       )}
                     </div>
@@ -417,8 +449,8 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
             </Section>
 
             <div className="flex items-center justify-end gap-3 border-t border-border p-5">
-              {selectedModelFamily && selectedFamilyLabel && (
-                <span className="text-sm text-muted-foreground">{selectedFamilyLabel} key required for this model.</span>
+              {keyMissing && requiredKeys[0] && (
+                <span className="text-sm text-muted-foreground">{requiredKeys[0].label} key required for this model.</span>
               )}
               {saved && (
                 <span className="flex items-center gap-1 text-sm text-green-600">
@@ -463,52 +495,28 @@ function Section({
   );
 }
 
-function modelFamilyFor(model: string, settings?: AppSettings): string | undefined {
-  const optionFamily = settings?.model_options.find((option) => option.value === model)?.family;
-  if (optionFamily) {
-    return optionFamily;
-  }
-  const normalized = model.toLowerCase();
-  if (normalized.startsWith('gpt-') || normalized.startsWith('o1') || normalized.startsWith('o3') || normalized.startsWith('o4') || normalized.startsWith('openai/')) {
-    return 'openai';
-  }
-  if (normalized.startsWith('claude-') || normalized.startsWith('anthropic/')) {
-    return 'anthropic';
-  }
-  if (normalized.startsWith('gemini') || normalized.startsWith('google/')) {
-    return 'google';
-  }
-  return undefined;
-}
-
 function toPositiveInteger(value: string): number {
   const parsed = Math.trunc(Number(value));
   return Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
 }
 
-function validateSettingsBeforeSave(
-  settings: AppSettings | undefined,
+function validateBeforeSave(
+  keyFields: KeyField[],
+  apiKeys: Record<string, string>,
+  keyMissing: boolean,
+  firstRequired: { env: string; label: string } | undefined,
   model: string,
-  selectedFamily: ApiKeyFamily | undefined,
-  apiKeys: Record<ApiKeyFamily, string>,
-  clearedKeys: Record<ApiKeyFamily, boolean>,
 ): Record<string, string> {
   const errors: Record<string, string> = {};
-  for (const family of MODEL_FAMILIES) {
-    const value = apiKeys[family.key].trim();
-    if (value && !API_KEY_PATTERNS[family.key].test(value)) {
-      errors[`api_keys.${family.key}`] = `The ${family.label} API key does not look valid. Check the key and try again.`;
+  for (const field of keyFields) {
+    const value = (apiKeys[field.env] || '').trim();
+    const pattern = KEY_PATTERNS[field.env];
+    if (value && pattern && !pattern.test(value)) {
+      errors[`api_keys.${field.env}`] = `The ${field.label} API key does not look valid. Check the key and try again.`;
     }
   }
-  if (!selectedFamily) {
-    return errors;
-  }
-  const family = MODEL_FAMILIES.find((item) => item.key === selectedFamily);
-  const field = `api_keys.${selectedFamily}`;
-  const hasSavedKey = Boolean(settings?.api_keys[selectedFamily]?.configured) && !clearedKeys[selectedFamily];
-  const hasNewKey = Boolean(apiKeys[selectedFamily].trim());
-  if (!hasSavedKey && !hasNewKey) {
-    errors[field] = `Add a ${family?.label || selectedFamily} API key before saving ${model}.`;
+  if (keyMissing && firstRequired) {
+    errors[`api_keys.${firstRequired.env}`] = `Add a ${firstRequired.label} API key before saving ${model}.`;
   }
   return errors;
 }

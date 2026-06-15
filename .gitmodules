@@ -1,4 +1,4 @@
 [submodule "external/lea-prover"]
 	path = external/lea-prover
-	url = https://github.com/darturi/lea-prover.git
-	branch = thrm_permission
+	url = https://github.com/shaswatpatel123/lea-prover.git
+	branch = safe-verify-all-features

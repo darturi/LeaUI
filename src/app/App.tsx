@@ -41,8 +41,10 @@ import {
   listProjects,
   listSessions,
   submitApproval,
+  submitSafeVerify,
   unassignProjectTheorem,
 } from './api';
+import type { SafeVerifyResult } from './api';
 
 export type ActiveTimelineTarget = {
   runId?: string;
@@ -66,6 +68,7 @@ export default function App() {
   const [isSubmittingApproval, setIsSubmittingApproval] = useState(false);
   const [approvalError, setApprovalError] = useState<string>();
   const [error, setError] = useState<string>();
+  const [safeVerify, setSafeVerify] = useState<SafeVerifyResult | null>(null);
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
   const [approvalEvents, setApprovalEvents] = useState<ApprovalEvent[]>([]);
   const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
@@ -85,6 +88,7 @@ export default function App() {
   const codeStepsRef = useRef<CodeStep[]>([]);
   const activeTimelineTargetRef = useRef<ActiveTimelineTarget>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
+  const safeVerifyRunIdRef = useRef<string | null>(null);
   const statusEventsRef = useRef<StatusEvent[]>([]);
   const approvalEventsRef = useRef<ApprovalEvent[]>([]);
   const pendingApprovalRef = useRef<PendingApproval | undefined>(undefined);
@@ -195,6 +199,12 @@ export default function App() {
     );
     setIsRunning(Boolean(detail.active_run));
     setApprovalError(undefined);
+    const sv = detail.safe_verify || null;
+    setSafeVerify(sv);
+    // Resume an unfinished audit if we reload while it was still pending/running.
+    if (sv?.run_id && (sv.status === 'pending' || sv.status === 'running') && !detail.active_run) {
+      void runSafeVerify(sv.run_id);
+    }
   };
 
   const loadSession = async (sessionId: string) => {
@@ -208,6 +218,36 @@ export default function App() {
     const detail = await getSession(sessionId);
     applySessionDetail(detail);
     await refreshUnassignmentAvailability(detail);
+  };
+
+  // Kernel-level SafeVerify audit of a finished proof. Fired automatically when a
+  // run completes successfully (and on reload while a verdict is still pending),
+  // so users always see whether the proof really holds — not just that it compiled.
+  const runSafeVerify = async (runId: string) => {
+    if (safeVerifyRunIdRef.current === runId) {
+      return; // already in flight for this run
+    }
+    safeVerifyRunIdRef.current = runId;
+    setSafeVerify({ run_id: runId, status: 'running' });
+    try {
+      let result = await submitSafeVerify(runId);
+      // Another request may hold the single-run lock; poll until it resolves.
+      let attempts = 0;
+      while (result.status === 'running' && attempts < 60) {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        attempts += 1;
+        result = await submitSafeVerify(runId);
+      }
+      setSafeVerify({ ...result, run_id: runId });
+    } catch (err) {
+      setSafeVerify({
+        run_id: runId,
+        status: 'error',
+        detail: err instanceof Error ? err.message : 'SafeVerify request failed.',
+      });
+    } finally {
+      safeVerifyRunIdRef.current = null;
+    }
   };
 
   const selectedSession = useMemo(
@@ -298,6 +338,7 @@ export default function App() {
       ]);
       setActiveTimelineStep(null);
       setIsRunning(true);
+      setSafeVerify(null); // a new attempt invalidates any prior verdict
 
       const nextSessions = await refreshSessions();
       if (!selectedSessionId && nextSessions.length === 1) {
@@ -531,7 +572,7 @@ export default function App() {
         }
       });
 
-      source.addEventListener('done', async () => {
+      source.addEventListener('done', async (event) => {
         sawTerminalEvent = true;
         eventSourceRef.current = null;
         source.close();
@@ -540,8 +581,17 @@ export default function App() {
         setPendingApproval(undefined);
         setApprovalError(undefined);
         setActiveTimelineStep(null);
+        let safeVerifyPending = false;
+        try {
+          safeVerifyPending = JSON.parse((event as MessageEvent).data || '{}').safe_verify === 'pending';
+        } catch {
+          safeVerifyPending = false;
+        }
         await reconcileSession(run.session_id);
         await refreshSessions();
+        if (safeVerifyPending) {
+          void runSafeVerify(run.run_id);
+        }
       });
 
       source.onerror = async () => {
@@ -791,6 +841,7 @@ export default function App() {
             error={error}
             isPaused={isPaused}
             isRunning={isRunning}
+            safeVerify={safeVerify}
             messages={messages}
             codeSteps={codeSteps}
             sessionStatus={selectedSession?.status}

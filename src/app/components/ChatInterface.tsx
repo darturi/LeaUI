@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink, Link2, ArrowDown } from 'lucide-react';
-import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SessionStatus, StatusEvent } from '../api';
+import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SafeVerifyResult, SessionStatus, StatusEvent } from '../api';
 import { codeStepFallbackContent } from '../stepTimeline.mjs';
 import { timelineItemMatchesTarget } from '../timelineTarget.mjs';
 import { buildRunTimelineSections } from '../runAttempts';
 import { MarkdownMessage } from './MarkdownMessage';
+import { SafeVerifyBadge } from './SafeVerifyBadge';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
 
 type ActiveTimelineTarget = {
@@ -53,11 +54,13 @@ export function ChatInterface({
   selectedProjectId,
   onProjectChange,
   onCreateProject,
+  safeVerify,
 }: {
   sessionId?: string;
   error?: string;
   isPaused: boolean;
   isRunning: boolean;
+  safeVerify?: SafeVerifyResult | null;
   pendingApproval?: PendingApproval;
   isSubmittingApproval: boolean;
   approvalError?: string;
@@ -105,7 +108,10 @@ export function ChatInterface({
     }
     const terminalMessage = [...messages]
       .reverse()
-      .find((message) => message.role === 'assistant' || message.role === 'system');
+      .find(
+        (message) =>
+          (message.role === 'assistant' || message.role === 'system') && message.kind !== 'chat',
+      );
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, sessionStatus]);
   const runSections = useMemo(() => {
@@ -544,6 +550,8 @@ export function ChatInterface({
             <div ref={bottomAnchorRef} aria-hidden="true" />
           </div>
         </div>
+
+        {safeVerify && !isRunning && <SafeVerifyBadge result={safeVerify} />}
 
         {showScrollToBottom && (
           <button

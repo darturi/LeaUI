@@ -304,6 +304,25 @@ def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
         )
 
 
+def set_session_api_session_id(session_id: str, api_session_id: str) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update sessions set api_session_id = ?, updated_at = ? where id = ?",
+            (api_session_id, now, session_id),
+        )
+
+
+def set_run_messages_kind(run_id: str, kind: str, role: str = "assistant") -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update messages set kind = ? where run_id = ? and role = ?",
+            (kind, run_id, role),
+        )
+        conn.execute("update runs set updated_at = ? where id = ?", (now, run_id))
+
+
 def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None:
     now = utc_now()
     value = json.dumps(pending_approval) if pending_approval is not None else None
@@ -314,22 +333,51 @@ def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None
         )
 
 
+def set_run_safe_verify(run_id: str, status: str, detail: str | None) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update runs set safe_verify_status = ?, safe_verify_detail = ?, updated_at = ? where id = ?",
+            (status, detail, now, run_id),
+        )
+
+
+def last_lean_code_step_for_run(run_id: str) -> dict | None:
+    """The final `.lean` proof snapshot for a run (used as the SafeVerify submission)."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from code_steps where run_id = ? order by step_number desc, created_at desc",
+            (run_id,),
+        ).fetchall()
+    for row in rows:
+        step = row_to_dict(row)
+        if str(step.get("kind") or "code") == "code" and str(step.get("path") or "").endswith(".lean"):
+            return step
+    return None
+
+
 def get_run(run_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
     return _normalize_run(row_to_dict(row)) if row else None
 
 
-def add_message(session_id: str, role: str, content: str, run_id: str | None = None) -> dict:
+def add_message(
+    session_id: str,
+    role: str,
+    content: str,
+    run_id: str | None = None,
+    kind: str = "assistant",
+) -> dict:
     now = utc_now()
     message_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into messages (id, session_id, run_id, role, content, created_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into messages (id, session_id, run_id, role, content, kind, created_at)
+            values (?, ?, ?, ?, ?, ?, ?)
             """,
-            (message_id, session_id, run_id, role, content, now),
+            (message_id, session_id, run_id, role, content, kind, now),
         )
         row = conn.execute("select * from messages where id = ?", (message_id,)).fetchone()
     touch_session(session_id)
@@ -512,6 +560,10 @@ def session_detail(session_id: str) -> dict | None:
             """,
             (session_id,),
         ).fetchone()
+        latest_run = conn.execute(
+            "select * from runs where session_id = ? order by created_at desc, id desc limit 1",
+            (session_id,),
+        ).fetchone()
         project = None
         if session.get("project_id"):
             project = conn.execute(
@@ -536,8 +588,17 @@ def session_detail(session_id: str) -> dict | None:
         "approval_events": approval_events_for_session(session_id),
         "usage_breakdown": usage_breakdown_for_session(session_id),
         "active_run": _normalize_run(row_to_dict(active_run)) if active_run else None,
+        "safe_verify": _safe_verify_summary(row_to_dict(latest_run)) if latest_run else None,
         "project": row_to_dict(project) if project else None,
     }
+
+
+def _safe_verify_summary(run: dict) -> dict | None:
+    """The latest run's SafeVerify verdict, for showing/auto-firing on reload."""
+    status = run.get("safe_verify_status")
+    if not status:
+        return None
+    return {"run_id": run.get("id"), "status": status, "detail": run.get("safe_verify_detail")}
 
 
 def usage_stats() -> dict:

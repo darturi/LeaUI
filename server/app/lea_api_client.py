@@ -30,13 +30,20 @@ class LeaApiClient:
         self.config = config
         self.transport = transport or (lambda request, timeout=None: urlopen(request, timeout=timeout))
 
-    def start_run(self, task: str, project: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start_run(
+        self,
+        task: str,
+        project: dict[str, Any] | None = None,
+        resume: bool | str = False,
+    ) -> dict[str, Any]:
         payload = {
             "task": task,
             "config": self._run_config(),
         }
         if project is not None:
             payload["project"] = project
+        if resume:
+            payload["resume"] = resume
         response = self._json_request("/v1/runs", method="POST", body=payload)
         if not isinstance(response.body, dict) or not response.body.get("run_id"):
             raise LeaApiError("Lea API did not return a run_id.")
@@ -127,6 +134,7 @@ class LeaApiClient:
     def _run_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
             "agent": {
+                "prompt_variant": "interactive",
                 "max_turns": self.config.max_turns,
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
@@ -140,6 +148,7 @@ class LeaApiClient:
                 config["model"]["model_kwargs"] = model_kwargs
         if self.config.max_turns is None:
             config["agent"] = {
+                "prompt_variant": "interactive",
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
                 "theorem_translation_max_retries": self.config.theorem_translation_max_retries,
@@ -147,14 +156,40 @@ class LeaApiClient:
         return config
 
     def _provider_model_kwargs(self) -> dict[str, str]:
-        family = _model_family(self.config.model)
-        if family == "anthropic" and self.config.anthropic_api_key:
-            return {"api_key": self.config.anthropic_api_key}
-        if family == "openai" and self.config.openai_api_key:
-            return {"api_key": self.config.openai_api_key}
-        if family == "google" and self.config.google_api_key:
-            return {"api_key": self.config.google_api_key}
-        return {}
+        # Forward the configured key for whatever provider the model needs, so it
+        # authenticates per-run (the Docker path, where the bundled Lea API isn't
+        # restarted with the key in its env). Works for any LiteLLM provider.
+        key = self._resolve_api_key()
+        return {"api_key": key} if key else {}
+
+    def _resolve_api_key(self) -> str | None:
+        from . import models_catalog
+
+        required: list[str] = []
+        if models_catalog.is_available():
+            required = list(models_catalog.requirements_for(self.config.model).get("required_keys") or [])
+        if not required:
+            env = _FAMILY_ENV.get(_model_family(self.config.model) or "")
+            required = [env] if env else []
+        for env in required:
+            value = self.config.api_keys.get(env)
+            if not value:
+                # Fallback for directly-constructed configs that set only the
+                # legacy typed field (google_api_key / anthropic_api_key / …).
+                family = _ENV_FAMILY.get(env)
+                if family:
+                    value = getattr(self.config, f"{family}_api_key", None)
+            if value:
+                return value
+        return None
+
+
+_FAMILY_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+}
+_ENV_FAMILY = {env: family for family, env in _FAMILY_ENV.items()}
 
 
 def _model_family(model: str | None) -> str | None:

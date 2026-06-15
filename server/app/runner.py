@@ -11,6 +11,7 @@ from queue import Queue
 from threading import Lock
 from typing import Any
 
+from . import safe_verify as safe_verify_service
 from . import settings as settings_service
 from . import store
 from .config import ROOT, LeaConfig
@@ -295,8 +296,10 @@ def _emit_no_code_step(
     return step
 
 
-def _emit_chat_message(context: RunnerContext, role: str, content: str) -> dict[str, Any]:
-    message = store.add_message(context.session_id, role, content, context.run_id)
+def _emit_chat_message(
+    context: RunnerContext, role: str, content: str, kind: str = "assistant"
+) -> dict[str, Any]:
+    message = store.add_message(context.session_id, role, content, context.run_id, kind=kind)
     emit(context.events, "message", message)
     return message
 
@@ -305,6 +308,7 @@ def _flush_assistant_turn(
     context: RunnerContext,
     chunks: list[str],
     persisted_texts: list[str],
+    kind: str = "assistant",
 ) -> dict[str, Any] | None:
     text = "".join(chunks).strip()
     chunks.clear()
@@ -313,7 +317,7 @@ def _flush_assistant_turn(
     if persisted_texts and persisted_texts[-1] == text:
         return None
     persisted_texts.append(text)
-    return _emit_chat_message(context, "assistant", text)
+    return _emit_chat_message(context, "assistant", text, kind=kind)
 
 
 def _event_type(frame: dict[str, Any]) -> str:
@@ -949,15 +953,21 @@ def _api_run_terminal_status(run_status: dict[str, Any]) -> str | None:
     return _api_run_status_to_local(run_status.get("status"))
 
 
-def _start_api_run(client: LeaApiClient, task: str, project: dict[str, Any] | None) -> dict[str, Any]:
+def _start_api_run(
+    client: LeaApiClient,
+    task: str,
+    project: dict[str, Any] | None,
+    resume: bool | str = False,
+) -> dict[str, Any]:
     signature = inspect.signature(client.start_run)
     params = signature.parameters
-    accepts_project = "project" in params or any(
-        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
-    )
-    if accepts_project:
-        return client.start_run(task, project=project)
-    return client.start_run(task)
+    has_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+    kwargs: dict[str, Any] = {}
+    if "project" in params or has_var_kw:
+        kwargs["project"] = project
+    if resume and ("resume" in params or has_var_kw):
+        kwargs["resume"] = resume
+    return client.start_run(task, **kwargs)
 
 
 def _is_timeout(exc: BaseException) -> bool:
@@ -983,6 +993,8 @@ def run_lea(context: RunnerContext) -> None:
     emitted_payloads: set[tuple[str, str]] = set()
     terminal_status: str | None = None
     terminal_error: str | None = None
+    api_session_id: str | None = None
+    assistant_mode = False
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
@@ -1004,7 +1016,9 @@ def run_lea(context: RunnerContext) -> None:
             max_turns=context.config.max_turns,
         )
 
-        run = _start_api_run(client, context.task, context.project)
+        session_row = store.get_session(context.session_id)
+        resume = (session_row or {}).get("api_session_id") or False
+        run = _start_api_run(client, context.task, context.project, resume=resume)
         api_run_id = str(run["run_id"])
         store.set_run_api_run_id(context.run_id, api_run_id)
         log_status(context, f"Lea API run started: {api_run_id}", status="api_run_started", api_run_id=api_run_id)
@@ -1028,6 +1042,13 @@ def run_lea(context: RunnerContext) -> None:
                     last_seq = max(last_seq, seq)
 
                 frame_type = _event_type(frame)
+                captured_session = _first_string(frame, "session_id")
+                if captured_session:
+                    api_session_id = captured_session
+                if frame_type in {"finished", "done", "completed"} and str(
+                    frame.get("reason") or ""
+                ).lower() == "assistant":
+                    assistant_mode = True
                 if frame_type == "approval_requested":
                     usage_breakdown.notice_approval(frame)
                     _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
@@ -1187,6 +1208,10 @@ def run_lea(context: RunnerContext) -> None:
                 status_cost_usd = _cost(terminal_run_status)
                 cost_usd = _merge_cost_total(cost_usd, status_cost_usd)
                 transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
+                api_session_id = _first_string(terminal_run_status, "session_id") or api_session_id
+                result = terminal_run_status.get("result")
+                if isinstance(result, dict) and str(result.get("reason") or "").lower() == "assistant":
+                    assistant_mode = True
             except Exception as status_exc:
                 log_status(
                     context,
@@ -1214,28 +1239,53 @@ def run_lea(context: RunnerContext) -> None:
         ):
             code_step_emitted = True
 
-        if terminal_status == "success" and not code_step_emitted:
-            _emit_terminal_no_code_step(context, api_run_id)
-            terminal_status = "failed"
-            terminal_error = (
-                "Lea API reported completion, but no readable Lean file or code artifact was exposed, "
-                "so the proof could not be verified."
-            )
-            log_status(context, terminal_error, status="missing_lean_artifact", api_run_id=api_run_id)
-        elif terminal_status == "max_turns" and not code_step_emitted:
-            _emit_terminal_no_code_step(context, api_run_id)
+        # An assistant/QA turn (explain, look up a lemma) legitimately produces no Lean
+        # file and runs no lean_check — it is not a proof, so the proof-completion
+        # guards below must not fire. Persist the captured agent session so the next
+        # turn in this chat resumes with full context.
+        if api_session_id:
+            store.set_session_api_session_id(context.session_id, api_session_id)
 
-        terminal_status, tool_check_failure = _terminal_status_after_tool_checks(terminal_status, tool_tracker)
-        if tool_check_failure:
-            terminal_error = tool_check_failure
-            log_status(context, tool_check_failure, status="lean_check_failed", api_run_id=api_run_id)
+        if assistant_mode:
+            if terminal_status not in {"failed", "max_spend"}:
+                terminal_status = "success"
+        else:
+            if terminal_status == "success" and not code_step_emitted:
+                _emit_terminal_no_code_step(context, api_run_id)
+                terminal_status = "failed"
+                terminal_error = (
+                    "Lea API reported completion, but no readable Lean file or code artifact was exposed, "
+                    "so the proof could not be verified."
+                )
+                log_status(context, terminal_error, status="missing_lean_artifact", api_run_id=api_run_id)
+            elif terminal_status == "max_turns" and not code_step_emitted:
+                _emit_terminal_no_code_step(context, api_run_id)
 
-        _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+            terminal_status, tool_check_failure = _terminal_status_after_tool_checks(terminal_status, tool_tracker)
+            if tool_check_failure:
+                terminal_error = tool_check_failure
+                log_status(context, tool_check_failure, status="lean_check_failed", api_run_id=api_run_id)
+
+        _flush_assistant_turn(
+            context,
+            assistant_turn_chunks,
+            persisted_assistant_texts,
+            kind="chat" if assistant_mode else "assistant",
+        )
+        if assistant_mode:
+            # Tag every assistant message from this run as a plain chat bubble so the
+            # timeline doesn't pair it with a (nonexistent) code step.
+            store.set_run_messages_kind(context.run_id, "chat")
         assistant_text = "".join(assistant_chunks).strip()
         if not persisted_assistant_texts and not assistant_text and terminal_transcript is not None:
             transcript_assistant_text = _assistant_text_from_transcript(terminal_transcript)
             if transcript_assistant_text:
-                _emit_chat_message(context, "assistant", transcript_assistant_text)
+                _emit_chat_message(
+                    context,
+                    "assistant",
+                    transcript_assistant_text,
+                    kind="chat" if assistant_mode else "assistant",
+                )
                 persisted_assistant_texts.append(transcript_assistant_text)
         terminal_notice = terminal_error or (
             final_text if terminal_status in {"failed", "max_turns", "max_spend"} else None
@@ -1243,7 +1293,12 @@ def run_lea(context: RunnerContext) -> None:
         display_text = _display_terminal_text(terminal_status, terminal_error or final_text)
 
         if display_text and display_text not in persisted_assistant_texts:
-            _emit_chat_message(context, "system" if terminal_notice else "assistant", display_text)
+            _emit_chat_message(
+                context,
+                "system" if terminal_notice else "assistant",
+                display_text,
+                kind="chat" if (assistant_mode and not terminal_notice) else "assistant",
+            )
         if terminal_status == "failed":
             emit(context.events, "run_error", {"message": display_text or "Lea API run failed."})
 
@@ -1261,6 +1316,16 @@ def run_lea(context: RunnerContext) -> None:
         )
         store.set_run_pending_approval(context.run_id, None)
         store.touch_session(context.session_id, terminal_status)
+        # A successful proof run gets a kernel-level SafeVerify audit. We only
+        # flag it as pending here; the browser fires the (~100s) check via
+        # /api/runs/{id}/safe-verify so it never blocks the `done` event.
+        safe_verify_pending = (
+            terminal_status == "success"
+            and not assistant_mode
+            and safe_verify_service.is_available(context.config)
+        )
+        if safe_verify_pending:
+            store.set_run_safe_verify(context.run_id, "pending", None)
         emit(
             context.events,
             "done",
@@ -1270,6 +1335,7 @@ def run_lea(context: RunnerContext) -> None:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": cost_usd,
+                "safe_verify": "pending" if safe_verify_pending else None,
             },
         )
     except Exception as exc:

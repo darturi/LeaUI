@@ -48,21 +48,32 @@ WORKDIR /app
 # Copy the submodule first so the expensive Mathlib bake is its own cache layer.
 COPY external/lea-prover ./external/lea-prover
 
-# Bake Mathlib: download the prebuilt oleans (multi-GB). `lake exe cache get`
-# resolves dependencies (clones Mathlib) and downloads the prebuilt cache
-# instead of compiling Mathlib from source.
+# Bake Mathlib AND build SafeVerify in one layer so they share a SINGLE Mathlib.
 #
-# NOTE: we do NOT run `lake build` here. The workspace's @[default_target] is
-# `lean_lib Lea` rooted at proofs/, which the agent populates at runtime — at
-# build time proofs/ is empty so `lake build` fails on a missing proofs/Lea.lean.
-# We only need Mathlib's oleans, so we just fetch the cache and verify it landed.
-WORKDIR /app/external/lea-prover/workspace
-RUN lake exe cache get \
+# Both the workspace and SafeVerify pin the identical Mathlib commit (and the
+# same transitive deps), so SafeVerify symlinks the workspace's already-baked
+# `.lake/packages` instead of downloading a second multi-GB copy. The image then
+# carries exactly one Mathlib. This is one RUN because the .git trim only frees
+# space when it happens in the same layer that created the files.
+#
+# `lake exe cache get` fetches Mathlib's prebuilt oleans (no source compile). We
+# do NOT `lake build` the workspace: its @[default_target] `lean_lib Lea` is
+# rooted at proofs/, which is empty until the agent writes there at runtime.
+# `safe_verify`, by contrast, has its own exe target and builds fine here.
+WORKDIR /app/external/lea-prover
+RUN cd workspace \
+ && lake exe cache get \
  && test -n "$(ls -A .lake/packages/mathlib/.lake/build/lib 2>/dev/null)" \
  && echo "[build] Mathlib oleans present" \
- && rm -rf .lake/packages/*/.git \
+ && cd /app/external/lea-prover/third_party/SafeVerify \
+ && rm -rf .lake/packages && mkdir -p .lake \
+ && ln -s /app/external/lea-prover/workspace/.lake/packages .lake/packages \
+ && lake build safe_verify \
+ && test -x .lake/build/bin/safe_verify \
+ && echo "[build] SafeVerify built against the shared Mathlib" \
+ && rm -rf /app/external/lea-prover/workspace/.lake/packages/*/.git \
  && rm -rf /root/.cache/mathlib \
- && echo "[build] removed dependency .git histories + compressed cache (~1GB)"
+ && echo "[build] one Mathlib shared; trimmed .git histories + cache"
 
 # Python deps for the agent + Lea API (creates external/lea-prover/.venv).
 WORKDIR /app/external/lea-prover

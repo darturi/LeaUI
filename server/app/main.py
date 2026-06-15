@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, StrictInt
 
 from .config import load_config
@@ -30,6 +30,7 @@ from .project_unassignment import (
 )
 from .project_usage import detect_project_formalization_dependents
 from .runner import RunnerContext, run_lea
+from . import safe_verify as safe_verify_service
 from . import settings as settings_service
 from . import store
 
@@ -160,6 +161,18 @@ def settings() -> dict:
     return settings_service.settings_payload()
 
 
+@app.get("/api/models")
+def models() -> dict:
+    """Full LiteLLM chat-model catalog for the searchable model picker."""
+    return {"models": settings_service.model_catalog()}
+
+
+@app.get("/api/models/requirements")
+def model_requirements(model: str) -> dict:
+    """Which API key(s) a model needs and whether they're configured."""
+    return settings_service.model_requirements(model)
+
+
 @app.put("/api/settings")
 def update_settings(request: SettingsRequest) -> dict:
     try:
@@ -250,6 +263,32 @@ def create_run(request: RunRequest) -> dict:
     }
 
 
+_TRANSLATION_APPROVAL_MARKER = "-theorem-translation-"
+
+
+def _cleanup_translation_proposals(approval_id: str, config) -> None:
+    """Best-effort removal of throwaway theorem-translation proposal files.
+
+    The Lea prover writes each preflight skeleton to
+    ``<lea_root>/workspace/proofs/.lea_proposals/<session>_theorem_translation_<n>.lean``
+    purely as a ``lean_check`` target. The ``approval_id`` is
+    ``<session>-theorem-translation-<candidate>``, so we can recover the session
+    prefix and drop the whole session's candidates. Once accepted the prover
+    uses the in-memory code and never reads these files again, so deletion is
+    safe and never fails the request.
+    """
+    idx = approval_id.rfind(_TRANSLATION_APPROVAL_MARKER)
+    if idx <= 0 or config.lea_root is None:
+        return
+    session_prefix = approval_id[:idx]
+    proposals_dir = config.lea_root / "workspace" / "proofs" / ".lea_proposals"
+    try:
+        for path in proposals_dir.glob(f"{session_prefix}_theorem_translation_*.lean"):
+            path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to clean up theorem-translation proposals: %s", exc)
+
+
 @app.post("/api/runs/{run_id}/approvals/{approval_id}")
 def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionRequest) -> dict:
     if request.decision not in {"accept", "reject"}:
@@ -265,8 +304,9 @@ def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionReq
     if not api_run_id:
         raise HTTPException(status_code=409, detail="Run is not ready for approval")
 
+    config = load_config()
     try:
-        return LeaApiClient(load_config()).resolve_approval(
+        result = LeaApiClient(config).resolve_approval(
             str(api_run_id),
             approval_id,
             request.decision,
@@ -275,6 +315,50 @@ def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionReq
     except LeaApiError as exc:
         status_code = exc.status if exc.status in {400, 401, 403, 404, 409, 422} else 502
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    if request.decision == "accept":
+        _cleanup_translation_proposals(approval_id, config)
+    return result
+
+
+_SAFE_VERIFY_TERMINAL = {"passed", "failed", "unavailable", "error"}
+
+
+@app.post("/api/runs/{run_id}/safe-verify")
+def safe_verify_run(run_id: str) -> dict:
+    """Run SafeVerify on a finished run's proof (kernel replay + axiom audit).
+
+    Idempotent: a cached terminal verdict is returned without re-running the
+    ~100s check. Concurrent callers get ``running`` instead of queuing a second.
+    """
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cached = run.get("safe_verify_status")
+    if cached in _SAFE_VERIFY_TERMINAL:
+        return {"status": cached, "detail": run.get("safe_verify_detail")}
+
+    config = load_config()
+    if not safe_verify_service.is_available(config):
+        store.set_run_safe_verify(run_id, "unavailable", "SafeVerify is not built on this server.")
+        return {"status": "unavailable", "detail": "SafeVerify is not built on this server."}
+
+    step = store.last_lean_code_step_for_run(run_id)
+    if not step:
+        store.set_run_safe_verify(run_id, "error", "No Lean proof file was found for this run.")
+        return {"status": "error", "detail": "No Lean proof file was found for this run."}
+
+    if not safe_verify_service.try_acquire():
+        store.set_run_safe_verify(run_id, "running", None)
+        return {"status": "running", "detail": "SafeVerify is already running."}
+    try:
+        store.set_run_safe_verify(run_id, "running", None)
+        result = safe_verify_service.verify(config, str(step.get("code") or ""), str(step.get("path") or ""))
+    finally:
+        safe_verify_service.release()
+    store.set_run_safe_verify(run_id, result["status"], result.get("detail"))
+    return result
 
 
 def sse(event_type: str, payload: dict) -> str:
@@ -376,6 +460,26 @@ def _project_theorem_for_session(detail: dict, config=None) -> dict | None:
         return None
 
 
+# --- Static frontend (bundled / single-container deploy) --------------------
+# In dev, Vite (:5173) serves the UI and proxies /api here, so this is skipped
+# (LEA_WEB_DIST is unset). In the Docker image LEA_WEB_DIST points at the built
+# `dist/`; the adapter then serves it on :8001 with SPA fallback. This route is
+# registered last, so every /api/* route above takes priority over it.
+_WEB_DIST = os.environ.get("LEA_WEB_DIST")
+if _WEB_DIST and Path(_WEB_DIST).is_dir():
+    _web_root = Path(_WEB_DIST).resolve()
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        # API paths are handled by the routes above; never hand them index.html.
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        # Serve a real built asset when it exists and stays inside the dist root.
+        candidate = (_web_root / full_path).resolve()
+        if full_path and candidate.is_file() and candidate.is_relative_to(_web_root):
+            return FileResponse(candidate)
+        # Otherwise hand back index.html for the SPA / client-side routing.
+        return FileResponse(_web_root / "index.html")
 def _code_steps_with_project_dependents(detail: dict, config) -> list[dict]:
     project = detail.get("project")
     enriched = []
