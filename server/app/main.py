@@ -28,6 +28,7 @@ from .project_unassignment import (
     project_theorem_for_proof_path,
     unassign_project_theorem,
 )
+from .project_usage import detect_project_formalization_dependents
 from .runner import RunnerContext, run_lea
 from . import safe_verify as safe_verify_service
 from . import settings as settings_service
@@ -189,7 +190,9 @@ def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Session not found")
-    detail["project_theorem"] = _project_theorem_for_session(detail)
+    config = load_config()
+    detail["project_theorem"] = _project_theorem_for_session(detail, config)
+    detail["code_steps"] = _code_steps_with_project_dependents(detail, config)
     return detail
 
 
@@ -430,13 +433,15 @@ def _project_payload(project_id: str | None, config) -> dict | None:
     context = full_path.read_text() if full_path.exists() else ""
     return {
         "project_id": project["slug"],
+        "project_slug": project["slug"],
+        "project_title": project["title"],
         "project_path": str(path),
         "project_context": context,
         "record_on_success": True,
     }
 
 
-def _project_theorem_for_session(detail: dict) -> dict | None:
+def _project_theorem_for_session(detail: dict, config=None) -> dict | None:
     project = detail.get("project")
     if not project:
         return None
@@ -449,7 +454,7 @@ def _project_theorem_for_session(detail: dict) -> dict | None:
     if not proof_path:
         return None
     try:
-        return project_theorem_for_proof_path(project, load_config(), proof_path)
+        return project_theorem_for_proof_path(project, config or load_config(), proof_path)
     except Exception:
         logger.debug("Unable to resolve project theorem for session %s", detail.get("id"), exc_info=True)
         return None
@@ -475,3 +480,33 @@ if _WEB_DIST and Path(_WEB_DIST).is_dir():
             return FileResponse(candidate)
         # Otherwise hand back index.html for the SPA / client-side routing.
         return FileResponse(_web_root / "index.html")
+def _code_steps_with_project_dependents(detail: dict, config) -> list[dict]:
+    project = detail.get("project")
+    enriched = []
+    for step in detail.get("code_steps") or []:
+        dependents = []
+        used = step.get("used_project_formalizations") or []
+        if project:
+            used = [_with_project_metadata(item, project) for item in used]
+        if project and step.get("kind", "code") == "code" and str(step.get("path") or "").endswith(".lean"):
+            dependents = detect_project_formalization_dependents(
+                project=project,
+                config=config,
+                proof_path=str(step.get("path") or ""),
+            )
+        enriched.append({
+            **step,
+            "used_project_formalizations": used,
+            "used_by_project_formalizations": dependents,
+        })
+    return enriched
+
+
+def _with_project_metadata(item: dict, project: dict) -> dict:
+    return {
+        **item,
+        "project_id": item.get("project_id") or project.get("id"),
+        "project_slug": item.get("project_slug") or project.get("slug"),
+        "project_title": item.get("project_title") or project.get("title") or project.get("slug"),
+        "project_path": item.get("project_path") or project.get("path"),
+    }

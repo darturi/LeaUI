@@ -1,5 +1,6 @@
 import type { ApprovalEvent, ChatMessage, CodeStep, PendingApproval, StatusEvent } from './api';
 import { buildStepTimeline } from './stepTimeline.mjs';
+import { timelineIndexForTarget } from './timelineTarget.mjs';
 
 export interface RunAttempt {
   runId: string;
@@ -17,15 +18,41 @@ export function timelineIndexForCodeStep(
   sections: RunTimelineSection[],
   codeStepId: string,
 ): number | null {
-  for (const section of sections) {
-    const itemIndex = section.timeline.stepItems.findIndex(
-      (item) => item.codeStep?.id === codeStepId,
-    );
-    if (itemIndex >= 0) {
-      return section.stepOffset + itemIndex;
-    }
-  }
-  return null;
+  return timelineIndexForTarget(sections, { codeStepId });
+}
+
+function parsedTime(value?: string | null): number {
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+}
+
+function compareText(a?: string | null, b?: string | null): number {
+  return String(a || '').localeCompare(String(b || ''));
+}
+
+function sortMessages(messages: ChatMessage[]): ChatMessage[] {
+  return [...messages].sort((a, b) => {
+    const timeDelta = parsedTime(a.created_at) - parsedTime(b.created_at);
+    return timeDelta || compareText(a.id, b.id);
+  });
+}
+
+function sortCodeSteps(codeSteps: CodeStep[]): CodeStep[] {
+  return [...codeSteps].sort((a, b) => {
+    const stepDelta = (a.step_number ?? Number.POSITIVE_INFINITY) - (b.step_number ?? Number.POSITIVE_INFINITY);
+    const turnDelta = (a.turn ?? Number.POSITIVE_INFINITY) - (b.turn ?? Number.POSITIVE_INFINITY);
+    const timeDelta = parsedTime(a.created_at) - parsedTime(b.created_at);
+    return stepDelta || turnDelta || timeDelta || compareText(a.id, b.id);
+  });
+}
+
+function sortStatusEvents(statusEvents: StatusEvent[]): StatusEvent[] {
+  return [...statusEvents].sort((a, b) => {
+    const timeDelta = parsedTime(a.created_at) - parsedTime(b.created_at);
+    const stepDelta =
+      (a.step_number ?? Number.POSITIVE_INFINITY) - (b.step_number ?? Number.POSITIVE_INFINITY);
+    return timeDelta || stepDelta || compareText(a.id, b.id);
+  });
 }
 
 export function buildRunAttempts({
@@ -112,9 +139,9 @@ export function buildRunTimelineSections({
 
   let stepOffset = 0;
   return runAttempts.map(({ runId, attemptNumber }) => {
-    const runMessages = messages.filter((message) => message.run_id === runId);
-    const runCodeSteps = codeSteps.filter((step) => step.run_id === runId);
-    const runStatusEvents = statusEvents.filter((event) => event.run_id === runId);
+    const runMessages = sortMessages(messages.filter((message) => message.run_id === runId));
+    const runCodeSteps = sortCodeSteps(codeSteps.filter((step) => step.run_id === runId));
+    const runStatusEvents = sortStatusEvents(statusEvents.filter((event) => event.run_id === runId));
     const runSystemTerminal = [...runMessages].reverse().find((message) => message.role === 'system');
     const runTerminalMessageId =
       terminalMessageId && runMessages.some((message) => message.id === terminalMessageId)

@@ -72,6 +72,39 @@ def test_stats_endpoint_returns_usage_rollups(tmp_path, monkeypatch):
     assert body["models"][0]["cost_usd"] == 0.03
 
 
+def test_stats_and_session_detail_include_running_usage(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    session = store.create_session("running usage")
+    run = store.create_run(session["id"], "o4-mini", None, 2)
+    store.add_message(session["id"], "user", "prove True", run["id"])
+    store.update_run(run["id"], "running", input_tokens=25, output_tokens=10, cost_usd=0.004)
+    store.replace_run_usage_breakdown(
+        run["id"],
+        [
+            {
+                "phase": "theorem_translation",
+                "label": "Theorem translation preflight",
+                "input_tokens": 25,
+                "output_tokens": 10,
+                "cost_usd": 0.004,
+                "event_count": 1,
+            }
+        ],
+    )
+
+    stats_body = main.stats()
+    detail = main.session_detail(session["id"])
+
+    assert stats_body["global"]["total_tokens"] == 35
+    assert abs(stats_body["global"]["cost_usd"] - 0.004) < 1e-9
+    assert stats_body["sessions"][0]["status"] == "running"
+    assert stats_body["sessions"][0]["total_tokens"] == 35
+    assert detail["total_tokens"] == 35
+    assert detail["usage_breakdown"][0]["total_tokens"] == 35
+
+
 def test_project_crud_and_run_selection(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
@@ -95,6 +128,52 @@ def test_project_crud_and_run_selection(tmp_path, monkeypatch):
 
     assert detail["project"]["slug"] == "epsilon"
     assert detail["active_run"]["project_id"] == project["id"]
+
+
+def test_session_detail_backfills_forward_usage_project_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(
+            model="o4-mini",
+            max_turns=2,
+            lea_api_base_url="http://127.0.0.1:8000",
+            lea_root=lea_root,
+        ),
+    )
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="epsilon"))
+    session = store.create_session("prove target", project_id=project["id"])
+    run = store.create_run(session["id"], "o4-mini", None, 2, project_id=project["id"])
+    store.add_code_step(
+        session["id"],
+        run["id"],
+        "workspace/proofs/Lea/Epsilon/target.lean",
+        "import Lea.Epsilon.helper\n\ntheorem target : True := by\n  exact helper",
+        used_project_formalizations=[
+            {
+                "name": "helper",
+                "proof_path": "workspace/proofs/Lea/Epsilon/helper.lean",
+                "module_name": "Lea.Epsilon.helper",
+            }
+        ],
+    )
+
+    detail = main.session_detail(session["id"])
+
+    assert detail["code_steps"][0]["used_project_formalizations"] == [
+        {
+            "name": "helper",
+            "proof_path": "workspace/proofs/Lea/Epsilon/helper.lean",
+            "module_name": "Lea.Epsilon.helper",
+            "project_id": project["id"],
+            "project_slug": "epsilon",
+            "project_title": "epsilon",
+            "project_path": "workspace/projects/epsilon.md",
+        }
+    ]
 
 
 def test_project_theorem_unassign_safe_move(tmp_path, monkeypatch):
@@ -196,6 +275,55 @@ def test_project_theorem_unassign_blocks_when_used_by_other_project_theorem(tmp_
     assert "even_square_of_double_plus_double" in exc.value.detail["message"]
     assert detail["project"]["slug"] == "epsilon"
     assert len(detail["code_steps"]) == 1
+
+
+def test_session_detail_marks_project_theorem_used_by_dependents(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    _write_project_fixture(
+        lea_root,
+        {
+            "helper": (
+                "import Mathlib\n\nnamespace Lea.Epsilon\n\n"
+                "theorem helper : True := by\n  trivial\n\nend Lea.Epsilon\n"
+            ),
+            "target": (
+                "import Mathlib\nimport Lea.Epsilon.helper\n\nnamespace Lea.Epsilon\n\n"
+                "theorem target : True := by\n  exact helper\n\nend Lea.Epsilon\n"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(model="o4-mini", max_turns=2, lea_api_base_url="http://127.0.0.1:8000", lea_root=lea_root),
+    )
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="Epsilon"))
+    session = store.create_session("prove helper", project_id=project["id"])
+    run = store.create_run(session["id"], "o4-mini", None, 2, project_id=project["id"])
+    store.add_code_step(
+        session["id"],
+        run["id"],
+        "workspace/proofs/Lea/Epsilon/helper.lean",
+        (lea_root / "workspace" / "proofs" / "Lea" / "Epsilon" / "helper.lean").read_text(),
+    )
+    store.update_run(run["id"], "success", final_text="done")
+    store.touch_session(session["id"], "success")
+
+    detail = main.session_detail(session["id"])
+
+    assert detail["code_steps"][0]["used_by_project_formalizations"] == [
+        {
+            "name": "target",
+            "proof_path": "workspace/proofs/Lea/Epsilon/target.lean",
+            "module_name": "Lea.Epsilon.target",
+            "project_id": project["id"],
+            "project_slug": "epsilon",
+            "project_title": "Epsilon",
+            "project_path": "workspace/projects/epsilon.md",
+        }
+    ]
 
 
 def test_project_theorem_unassign_verification_failure_rolls_back_session_state(tmp_path, monkeypatch):

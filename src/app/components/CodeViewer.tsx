@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { CodeStep } from '../api';
 import { diffForStep } from '../codeDiff';
+import { projectTagClass } from '../projectTags.js';
 import type { RunTimelineSection } from '../runAttempts';
 
 export function CodeViewer({
@@ -81,6 +82,8 @@ export function CodeViewer({
     }
     return diffForStep(codeSteps, currentCodeStepIndex);
   }, [codeSteps, currentStep, currentCodeStepIndex, hasCodeChangeForTimelineStep]);
+  const usedProjectFormalizations = currentStep?.used_project_formalizations || [];
+  const usedByProjectFormalizations = currentStep?.used_by_project_formalizations || [];
 
   const handlePrevious = () => {
     if (safeIndex > 0) {
@@ -184,6 +187,60 @@ export function CodeViewer({
                   ))}
                 </code>
               </pre>
+            )}
+            {usedProjectFormalizations.length > 0 && (
+              <div className="rounded-md border border-border bg-accent px-3 py-2 text-sm text-accent-foreground">
+                <div className="font-medium">
+                  {usedProjectFormalizations.length === 1
+                    ? 'User-defined formalization used'
+                    : 'User-defined formalizations used'}
+                </div>
+                <div className="mt-1 space-y-1 text-xs leading-relaxed">
+                  {usedProjectFormalizations.map((item) => {
+                    const projectTitle = item.project_title || item.project_slug || 'project';
+                    return (
+                      <p key={`${item.name}:${item.proof_path}`} className="break-words">
+                        Theorem <code className="font-mono">{item.name}</code> at{' '}
+                        <code className="font-mono">{item.proof_path}</code> from project{' '}
+                        <span
+                          className={`inline-flex max-w-full items-center rounded-full border px-2 py-0.5 font-medium ${projectTagClass(projectTitle)}`}
+                          title={projectTitle}
+                        >
+                          <span className="truncate">{projectTitle}</span>
+                        </span>{' '}
+                        was used in this formalization.
+                      </p>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {usedByProjectFormalizations.length > 0 && (
+              <div className="rounded-md border border-border bg-accent px-3 py-2 text-sm text-accent-foreground">
+                <div className="font-medium">
+                  {usedByProjectFormalizations.length === 1
+                    ? 'Used by another project formalization'
+                    : 'Used by other project formalizations'}
+                </div>
+                <div className="mt-1 space-y-1 text-xs leading-relaxed">
+                  {usedByProjectFormalizations.map((item) => {
+                    const projectTitle = item.project_title || item.project_slug || 'project';
+                    return (
+                      <p key={`${item.name}:${item.proof_path}`} className="break-words">
+                        Used by theorem <code className="font-mono">{item.name}</code> at{' '}
+                        <code className="font-mono">{item.proof_path}</code> as part of project{' '}
+                        <span
+                          className={`inline-flex max-w-full items-center rounded-full border px-2 py-0.5 font-medium ${projectTagClass(projectTitle)}`}
+                          title={projectTitle}
+                        >
+                          <span className="truncate">{projectTitle}</span>
+                        </span>
+                        .
+                      </p>
+                    );
+                  })}
+                </div>
+              </div>
             )}
           </div>
         )}

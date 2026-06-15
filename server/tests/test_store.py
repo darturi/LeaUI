@@ -42,6 +42,9 @@ def test_init_db_adds_cost_column_to_existing_runs_table(tmp_path, monkeypatch):
     assert "api_run_id" in columns
     assert "pending_approval" in columns
     with sqlite3.connect(db_path) as conn:
+        code_step_columns = [row[1] for row in conn.execute("pragma table_info(code_steps)").fetchall()]
+    assert "used_project_formalizations" in code_step_columns
+    with sqlite3.connect(db_path) as conn:
         usage_columns = [row[1] for row in conn.execute("pragma table_info(run_usage_breakdown)").fetchall()]
     assert "phase" in usage_columns
     assert "cost_usd" in usage_columns
@@ -73,6 +76,13 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
         kind="no_code",
         summary="Turn 2: no tool calls and no Lean file changes.",
         turn=2,
+        used_project_formalizations=[
+            {
+                "name": "helper",
+                "proof_path": "workspace/proofs/Lea/Epsilon/helper.lean",
+                "module_name": "Lea.Epsilon.helper",
+            }
+        ],
     )
     status_event = store.add_status_event(
         session["id"],
@@ -94,6 +104,13 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["kind"] == "no_code"
     assert detail["code_steps"][0]["summary"].startswith("Turn 2")
     assert detail["code_steps"][0]["turn"] == 2
+    assert detail["code_steps"][0]["used_project_formalizations"] == [
+        {
+            "name": "helper",
+            "proof_path": "workspace/proofs/Lea/Epsilon/helper.lean",
+            "module_name": "Lea.Epsilon.helper",
+        }
+    ]
     assert detail["status_events"][0]["id"] == status_event["id"]
     assert detail["status_events"][0]["step_number"] == 1
     assert detail["status_events"][0]["status"] == "code_step"

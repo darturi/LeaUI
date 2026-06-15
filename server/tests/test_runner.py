@@ -15,12 +15,21 @@ def event_log_dir(tmp_path, monkeypatch):
 
 
 class FakeLeaApiClient:
-    def __init__(self, events=None, status=None, transcript=None, transcript_error=None, fail_start=None):
+    def __init__(
+        self,
+        events=None,
+        status=None,
+        transcript=None,
+        transcript_error=None,
+        fail_start=None,
+        event_hook=None,
+    ):
         self.events = events or []
         self.status = status or {"status": "completed"}
         self.transcript = transcript
         self.transcript_error = transcript_error
         self.fail_start = fail_start
+        self.event_hook = event_hook
         self.cancelled = []
         self.transcript_requests = []
 
@@ -30,7 +39,10 @@ class FakeLeaApiClient:
         return {"run_id": "api-run-1"}
 
     def stream_events(self, api_run_id, from_seq=0, timeout=None):
-        yield from self.events
+        for event in self.events:
+            yield event
+            if self.event_hook:
+                self.event_hook(event)
 
     def get_run(self, api_run_id):
         return self.status
@@ -354,7 +366,48 @@ def test_usage_updated_events_accumulate_tokens_and_cost(tmp_path, monkeypatch):
     assert run["input_tokens"] == 125
     assert run["output_tokens"] == 50
     assert abs(run["cost_usd"] - 0.004) < 1e-9
+    usage_events = [event for event in events if event["type"] == "usage_updated"]
+    assert [event["payload"]["total_tokens"] for event in usage_events] == [140, 175]
+    assert abs(usage_events[-1]["payload"]["cost_usd"] - 0.004) < 1e-9
     assert events[-1]["payload"]["cost_usd"] == 0.004
+
+
+def test_usage_updated_events_persist_live_stats_before_terminal_event(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    snapshots = []
+
+    def capture_after_event(event):
+        if event["type"] != "usage_updated":
+            return
+        snapshots.append(
+            {
+                "run": store.get_run(context.run_id),
+                "stats": store.usage_stats(),
+                "detail": store.session_detail(context.session_id),
+            }
+        )
+
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 100, "output_tokens": 40, "cost": 0.003},
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        status={"status": "completed"},
+        event_hook=capture_after_event,
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    live = snapshots[0]
+    assert live["run"]["status"] == "running"
+    assert live["run"]["input_tokens"] == 100
+    assert live["run"]["output_tokens"] == 40
+    assert abs(live["run"]["cost_usd"] - 0.003) < 1e-9
+    assert live["stats"]["global"]["total_tokens"] == 140
+    assert abs(live["stats"]["global"]["cost_usd"] - 0.003) < 1e-9
+    assert live["detail"]["usage_breakdown"][0]["label"] == "Theorem translation preflight"
+    assert live["detail"]["usage_breakdown"][0]["total_tokens"] == 140
 
 
 def test_terminal_run_status_cost_overrides_partial_usage(tmp_path, monkeypatch):
@@ -705,6 +758,85 @@ def test_api_code_events_create_code_step(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["path"] == "workspace/proofs/demo.lean"
     assert detail["code_steps"][0]["turn"] == 1
     assert detail["code_steps"][0]["code"].startswith("theorem demo")
+
+
+def test_project_code_step_includes_used_formalizations(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    lea_root = tmp_path / "lea"
+    _write_project_usage_fixture(lea_root)
+    code = (
+        "import Mathlib\n"
+        "import Lea.Epsilon.helper\n\n"
+        "namespace Lea.Epsilon\n\n"
+        "theorem target : True := by\n"
+        "  exact helper\n\n"
+        "end Lea.Epsilon\n"
+    )
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "code_step",
+                "path": "workspace/proofs/Lea/Epsilon/target.lean",
+                "code": code,
+                "turn": 1,
+            },
+            {"seq": 1, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/Lea/Epsilon/target.lean"}},
+            {"seq": 2, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 3, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+    context.config = make_config(tmp_path, lea_root=lea_root)
+    context.project = {
+        "project_id": "epsilon",
+        "project_path": "workspace/projects/epsilon.md",
+        "project_context": "",
+        "record_on_success": True,
+    }
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    detail = store.session_detail(context.session_id)
+    expected = [
+        {
+            "name": "helper",
+            "proof_path": "workspace/proofs/Lea/Epsilon/helper.lean",
+            "module_name": "Lea.Epsilon.helper",
+            "project_id": "epsilon",
+            "project_slug": "epsilon",
+            "project_title": "epsilon",
+            "project_path": "workspace/projects/epsilon.md",
+        }
+    ]
+    assert detail["code_steps"][0]["used_project_formalizations"] == expected
+    code_event = next(event for event in events if event["type"] == "code_step")
+    assert code_event["payload"]["used_project_formalizations"] == expected
+
+
+def test_non_project_code_step_has_no_used_formalizations(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "code_step",
+                "path": "workspace/proofs/demo.lean",
+                "code": "theorem demo : True := by\n  trivial",
+                "turn": 1,
+            },
+            {"seq": 1, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 2, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 3, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["used_project_formalizations"] == []
 
 
 def test_nested_write_file_tool_call_creates_code_step(tmp_path, monkeypatch):
@@ -1388,3 +1520,26 @@ def test_assistant_turn_renders_as_chat_and_resumes(tmp_path, monkeypatch):
     assert detail["code_steps"] == []
     # The agent session id is persisted so the next turn keeps resuming it.
     assert store.get_session(context.session_id)["api_session_id"] == "agent-sess-9"
+def _write_project_usage_fixture(lea_root):
+    project_dir = lea_root / "workspace" / "projects"
+    project_dir.mkdir(parents=True)
+    (project_dir / "epsilon.md").write_text(
+        "\n".join(
+            [
+                "# Project epsilon",
+                "",
+                '<!-- lea:project id="epsilon" -->',
+                "",
+                "## Theorem: helper",
+                "",
+                '<!-- lea:theorem name="helper" proof="workspace/proofs/Lea/Epsilon/helper.lean" module="Lea.Epsilon.helper" -->',
+                "",
+                "### Signature",
+                "",
+                "```lean",
+                "theorem helper : True := by",
+                "```",
+                "",
+            ]
+        )
+    )

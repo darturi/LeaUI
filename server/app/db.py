@@ -89,6 +89,7 @@ def init_db() -> None:
                 kind text not null default 'code',
                 summary text,
                 turn integer,
+                used_project_formalizations text,
                 created_at text not null
             );
 
@@ -130,6 +131,8 @@ def init_db() -> None:
             conn.execute("alter table code_steps add column summary text")
         if "turn" not in columns:
             conn.execute("alter table code_steps add column turn integer")
+        if "used_project_formalizations" not in columns:
+            conn.execute("alter table code_steps add column used_project_formalizations text")
 
         run_columns = {
             row["name"]

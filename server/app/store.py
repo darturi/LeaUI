@@ -200,6 +200,7 @@ def record_project_unassignment(
     dest_rel: str,
     code: str,
     message: str,
+    used_project_formalizations: list[dict[str, Any]] | None = None,
 ) -> list[dict]:
     now = utc_now()
     code_steps: list[dict] = []
@@ -221,8 +222,11 @@ def record_project_unassignment(
             step_id = str(uuid4())
             conn.execute(
                 """
-                insert into code_steps (id, session_id, run_id, step_number, path, code, kind, summary, turn, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                insert into code_steps (
+                    id, session_id, run_id, step_number, path, code, kind, summary, turn,
+                    used_project_formalizations, created_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     step_id,
@@ -234,6 +238,7 @@ def record_project_unassignment(
                     "code",
                     "Moved proof out of project namespace into Lea.Misc.",
                     None,
+                    _dump_used_project_formalizations(used_project_formalizations),
                     now,
                 ),
             )
@@ -254,7 +259,7 @@ def record_project_unassignment(
                 (event_id, session_id, run_id, step_number, "project_unassigned", message, now),
             )
             inserted = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
-            code_steps.append(row_to_dict(inserted))
+            code_steps.append(_normalize_code_step(row_to_dict(inserted)))
     return code_steps
 
 
@@ -387,6 +392,7 @@ def add_code_step(
     kind: str = "code",
     summary: str | None = None,
     turn: int | None = None,
+    used_project_formalizations: list[dict[str, Any]] | None = None,
 ) -> dict:
     now = utc_now()
     step_id = str(uuid4())
@@ -398,14 +404,29 @@ def add_code_step(
         step_number = int(row["next_step"])
         conn.execute(
             """
-            insert into code_steps (id, session_id, run_id, step_number, path, code, kind, summary, turn, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into code_steps (
+                id, session_id, run_id, step_number, path, code, kind, summary, turn,
+                used_project_formalizations, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (step_id, session_id, run_id, step_number, path, code, kind, summary, turn, now),
+            (
+                step_id,
+                session_id,
+                run_id,
+                step_number,
+                path,
+                code,
+                kind,
+                summary,
+                turn,
+                _dump_used_project_formalizations(used_project_formalizations),
+                now,
+            ),
         )
         inserted = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
     touch_session(session_id)
-    return row_to_dict(inserted)
+    return _normalize_code_step(row_to_dict(inserted))
 
 
 def add_status_event(
@@ -562,7 +583,7 @@ def session_detail(session_id: str) -> dict | None:
         **session,
         **usage,
         "messages": [row_to_dict(row) for row in messages],
-        "code_steps": [row_to_dict(row) for row in code_steps],
+        "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
         "status_events": [row_to_dict(row) for row in status_events],
         "approval_events": approval_events_for_session(session_id),
         "usage_breakdown": usage_breakdown_for_session(session_id),
@@ -651,6 +672,27 @@ def _normalize_usage_session(row: dict) -> dict:
     row["cost_usd"] = float(row.get("cost_usd") or 0)
     row["started_at"] = row.get("started_at")
     row["ended_at"] = row.get("ended_at")
+    return row
+
+
+def _dump_used_project_formalizations(value: list[dict[str, Any]] | None) -> str | None:
+    if not value:
+        return None
+    return json.dumps(value)
+
+
+def _normalize_code_step(row: dict) -> dict:
+    raw = row.get("used_project_formalizations")
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = []
+    elif isinstance(raw, list):
+        parsed = raw
+    else:
+        parsed = []
+    row["used_project_formalizations"] = parsed if isinstance(parsed, list) else []
     return row
 
 
