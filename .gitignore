@@ -8,6 +8,10 @@ __pycache__/
 data/
 config/lea.local.toml
 
+# Runtime dirs created by run-lea.sh / docker (persisted DB, settings, key)
+lea-data/
+lea-config/
+
 # Local working notes / agent instructions — not part of the shipped repo
 CLAUDE.md
 TODO.md

@@ -18,6 +18,7 @@ external/lea-prover/.venv
 # Built Lean artifacts from the host (rebuilt inside the image for linux/arm64)
 external/lea-prover/workspace/.lake
 external/lea-prover/.lake
+external/lea-prover/third_party/SafeVerify/.lake
 
 # Local runtime data and secrets — must never enter the image
 data

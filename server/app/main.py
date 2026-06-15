@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, StrictInt
 
 from .config import load_config
@@ -453,3 +453,25 @@ def _project_theorem_for_session(detail: dict) -> dict | None:
     except Exception:
         logger.debug("Unable to resolve project theorem for session %s", detail.get("id"), exc_info=True)
         return None
+
+
+# --- Static frontend (bundled / single-container deploy) --------------------
+# In dev, Vite (:5173) serves the UI and proxies /api here, so this is skipped
+# (LEA_WEB_DIST is unset). In the Docker image LEA_WEB_DIST points at the built
+# `dist/`; the adapter then serves it on :8001 with SPA fallback. This route is
+# registered last, so every /api/* route above takes priority over it.
+_WEB_DIST = os.environ.get("LEA_WEB_DIST")
+if _WEB_DIST and Path(_WEB_DIST).is_dir():
+    _web_root = Path(_WEB_DIST).resolve()
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        # API paths are handled by the routes above; never hand them index.html.
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        # Serve a real built asset when it exists and stays inside the dist root.
+        candidate = (_web_root / full_path).resolve()
+        if full_path and candidate.is_file() and candidate.is_relative_to(_web_root):
+            return FileResponse(candidate)
+        # Otherwise hand back index.html for the SPA / client-side routing.
+        return FileResponse(_web_root / "index.html")
